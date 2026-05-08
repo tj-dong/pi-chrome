@@ -1,0 +1,31 @@
+{
+	"name": "pi-chrome",
+	"version": "0.7.0",
+	"description": "Drive your existing logged-in Chrome from Pi — no re-login, no throwaway profile, watch the agent work in real time (or toggle quiet background mode).",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"chrome",
+		"browser",
+		"automation",
+		"authenticated-session",
+		"real-profile",
+		"web-debugging"
+	],
+	"license": "MIT",
+	"type": "commonjs",
+	"files": [
+		"extensions",
+		"README.md"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/chrome-profile-bridge/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	}
+}

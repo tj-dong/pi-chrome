@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Pi Existing Chrome Profile Bridge",
+  "version": "0.7.0",
+  "description": "Lets Pi control tabs in this existing Chrome profile via a local bridge at 127.0.0.1.",
+  "permissions": ["tabs", "scripting", "storage", "activeTab", "alarms"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:17318/*"],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Pi Chrome Bridge"
+  }
+}
