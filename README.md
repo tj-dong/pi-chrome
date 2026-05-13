@@ -52,10 +52,9 @@ pi-chrome v<version>
 ## Try this in 30 seconds after install
 
 ```text
-Use chrome_tab list to find my GitHub notifications tab.
-chrome_snapshot it, then write a 5-bullet triage:
-which PRs need my review today, sorted by staleness.
-Do not click anything yet.
+Look at my GitHub notifications tab and triage which PRs
+need my review today, sorted by staleness.
+Don't click anything yet — just read and summarize.
 ```
 
 You'll watch the agent jump to your GitHub tab and read the page — using **your** session, **your** filters, **your** orgs.
@@ -69,7 +68,7 @@ Each recipe assumes the relevant tab is already open in the Chrome you control.
 **PR triage**
 
 ```text
-You:    "Use chrome_tab list to find my GitHub notifications tab, then summarize PRs needing my review today, sorted by staleness."
+You:    "Look at my GitHub notifications tab and summarize the PRs needing my review today, sorted by staleness."
 Agent:  chrome_tab(list) → chrome_snapshot(uid:el-notifications) → chrome_evaluate(...)
         ✓ 7 PRs waiting on you. 2 stale >3d (storage-rewrite, billing-v2).
           1 just turned CI-green (api-keys-prune). Full sorted list below.
@@ -79,7 +78,7 @@ You:    [pastes the list straight into Linear]
 **Linear standup**
 
 ```text
-You:    "Open my Linear current cycle in the active tab and write a 5-bullet standup."
+You:    "Open my Linear current cycle and write a 5-bullet standup from it."
 Agent:  chrome_tab(activate, urlIncludes:"linear.app") → chrome_snapshot(uid:el-cycle) → chrome_evaluate(...)
         ✓ 5 in-progress, 2 blocked. Standup draft:
           • Shipped: bridge auto-recover.   • In flight: trusted-mode retry path.
@@ -91,7 +90,7 @@ You:    [drops it into #standup]
 **Bug repro with evidence**
 
 ```text
-You:    "Repro the checkout 500 on staging, save a screenshot at each step under ./repro/."
+You:    "Reproduce the checkout 500 on staging. Save a screenshot at each step under ./repro/."
 Agent:  chrome_navigate(staging) → chrome_click(uid:el-add-to-cart) → chrome_screenshot(./repro/01-cart.png)
         → chrome_click(uid:el-checkout) → chrome_list_network_requests() → chrome_screenshot(./repro/02-500.png)
         ✓ POST /api/checkout → 500. Response body saved → ./repro/checkout-500.json
@@ -112,13 +111,13 @@ You:    [files the ticket with the folder attached]
 > Snapshot `localhost:3000` and the staging URL of the same page; tell me what's visually different.
 
 **Auth-only data pull**
-> Open my analytics dashboard tab and `chrome_evaluate` to extract today's KPIs from page state.
+> Open my analytics dashboard tab and pull today's KPIs from the page.
 
 **Network forensics**
-> Reproduce the checkout bug, then use `chrome_list_network_requests` to find the failing call and dump its response body.
+> Reproduce the checkout bug, find the failing API call, and dump its response body.
 
 **File upload through React**
-> Open the photo uploader, `chrome_upload_file` with `./fixtures/sample.png`, confirm preview rendered.
+> Open the photo uploader, upload `./fixtures/sample.png`, confirm the preview renders.
 
 </details>
 
