@@ -436,9 +436,10 @@ export default function (pi: ExtensionAPI): void {
 Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile, no CDP, no throwaway profile.
 
 Capability model (important):
-- All input is **synthetic DOM events** (\`isTrusted=false\`). Synthetic events drive React/Vue/Angular state fine, but they do NOT satisfy Chrome's user-activation gates: audio/video autoplay, clipboard write, file pickers, fullscreen, and Web Push prompts will NOT open from a chrome_click.
-- \`chrome_evaluate\` runs in MAIN world via the Function constructor. It works on pages with strict CSP (\`script-src 'self'\` without \`'unsafe-eval'\`), and surfaces thrown exceptions.
-- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If \`pageMutated\` is false after a click that should have changed something, the click likely didn't take effect — do NOT just retry; check the action result and snapshot for the cause.
+- Default input path is **synthetic DOM events** (\`isTrusted=false\`). Synthetic events drive React/Vue/Angular state fine, but they do NOT satisfy Chrome's user-activation gates: audio/video autoplay, clipboard write, file pickers, fullscreen, and Web Push prompts will NOT open from a synthetic chrome_click.
+- **Trusted escape hatch**: chrome_click / chrome_type / chrome_key / chrome_fill / chrome_hover / chrome_drag / chrome_scroll all accept \`trusted: true\`, which dispatches through chrome.debugger / CDP. Trusted events are browser-trusted (\`isTrusted=true\`) and **bypass page CSP entirely** because they're injected at the input layer, not via JS. Default mode is \`auto\`: synthetic first, silent CDP retry only when the click looks gated. If a synthetic click/type produced no \`pageMutated\` or you got a CSP/eval error from chrome_evaluate, escalate to \`trusted: true\` yourself — don't ask the user.
+- \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via the **Function constructor**, which requires \`'unsafe-eval'\` in the page CSP. Pages with strict CSP (e.g. github.com, many bank/SaaS apps) will throw \`EvalError: ... 'unsafe-eval' is not an allowed source of script\` and chrome_snapshot will return empty. On those pages, drive the page with \`chrome_screenshot\` (extension API, not gated by CSP) + \`chrome_click\`/\`chrome_type\`/\`chrome_key\` with \`trusted: true\` and viewport coordinates. \`chrome_navigate\`, \`chrome_screenshot\`, \`chrome_tab\`, and trusted input all keep working under any CSP.
+- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If \`pageMutated\` is false after a click that should have changed something, the click likely didn't take effect — do NOT just retry the same way; either escalate to \`trusted: true\` or check the snapshot for occlusion.
 
 Usage rules:
 1. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
@@ -446,7 +447,7 @@ Usage rules:
 3. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
 4. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
 5. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome quiet to silence the whole session.
-6. If you hit an autoplay/clipboard/file-picker gate, tell the user; this bridge cannot satisfy it.
+6. If you hit an autoplay/clipboard/file-picker gate, tell the user; this bridge cannot satisfy it. (Generic clicks/typing/CSP gates are fine — escalate to \`trusted: true\`.)
 7. Run /chrome doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
 		return { systemPrompt: event.systemPrompt + primer };
