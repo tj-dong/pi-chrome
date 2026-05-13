@@ -518,13 +518,13 @@ Usage rules:
 						permissionGranted?: boolean;
 					};
 					if (status.permissionGranted) {
-						const banner = status.attachedTabs && status.attachedTabs.length ? ` (yellow banner up on ${status.attachedTabs.length} tab(s))` : "";
+						const banner = status.attachedTabs && status.attachedTabs.length ? ` (‘Pi Chrome Connector started debugging this browser’ banner up on ${status.attachedTabs.length} tab(s))` : "";
 						const note =
 							status.mode === "auto"
-								? " Clicks/keys are quiet by default; if a site rejects a quiet click, pi-chrome retries it once with a real-looking click. Yellow 'pi-chrome is controlling Chrome' banner shows only when that retry happens."
+								? " Clicks/keys are quiet by default; if a site rejects a quiet click, pi-chrome retries it once with a real-looking click. The Chrome banner shows only when that retry happens."
 								: status.mode === "on"
-									? " Every click and keystroke uses a real-looking event. Yellow 'pi-chrome is controlling Chrome' banner stays up on every tab pi-chrome touches."
-									: " All clicks are quiet, no yellow banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Switch to /chrome-trusted auto if a site isn't responding.";
+									? " Every click and keystroke uses a real-looking event. The Chrome banner stays up on every tab pi-chrome touches."
+									: " All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Switch to /chrome-trusted auto if a site isn’t responding.";
 						const label = status.mode === "auto" ? "auto (smart upgrade)" : status.mode === "on" ? "on (always real-looking)" : "off (always quiet)";
 						lines.push(`✓ Click mode: ${label}${banner}.${note}`);
 					} else {
@@ -541,7 +541,7 @@ Usage rules:
 
 	pi.registerCommand("chrome-trusted", {
 		description:
-			"Choose how realistically pi-chrome should drive Chrome. Real-looking clicks/keys unlock things like copy-to-clipboard buttons, file pickers, and sign-in pages, but show a yellow 'pi-chrome is controlling Chrome' banner. Three modes:\n  auto (default) — quiet by default; auto-upgrade when a site blocks the quiet click.\n  off — always quiet, no banner; some sites won't accept these clicks.\n  on — always real-looking, banner stays up the whole session.\n  status — show the current mode.",
+			"Choose how realistically pi-chrome should drive Chrome. Real-looking clicks/keys unlock things like copy-to-clipboard buttons, file pickers, and sign-in pages, but show a banner at the top of every Chrome window saying it's being driven by pi-chrome. Three modes:\n  auto (default) — quiet by default; auto-upgrade when a site blocks the quiet click.\n  off — always quiet, no banner; some sites won't accept these clicks.\n  on — always real-looking, banner stays up the whole session.\n  status — show the current mode.",
 		getArgumentCompletions: (prefix) => {
 			const items = [
 				{ value: "auto", label: "auto", description: "Default. Quiet clicks; upgrade to real ones only when a site rejects them." },
@@ -580,7 +580,7 @@ Usage rules:
 				on: "on (always real-looking)",
 			};
 			const friendly = (m: string) => MODE_NAMES[m] ?? m;
-			const attached = status.attachedTabs?.length ? ` — yellow banner currently up on ${status.attachedTabs.length} tab(s)` : "";
+			const attached = status.attachedTabs?.length ? ` — banner currently up on ${status.attachedTabs.length} tab(s)` : "";
 			const current = status.mode;
 
 			let target = rawArg;
@@ -592,8 +592,8 @@ Usage rules:
 				// Interactive picker. Plain-English descriptions; no jargon.
 				const options = [
 					`auto${current === "auto" ? " (current)" : ""} — quiet by default; if a site rejects a quiet click, retry it once with a real-looking click. Yellow banner appears only when needed. Recommended for everyday use.`,
-					`off${current === "off" ? " (current)" : ""} — always quiet. No yellow banner, ever. Fast and unobtrusive, but some sites (sign-in pages, copy-to-clipboard buttons, file pickers, paywalls) will silently ignore the click.`,
-					`on${current === "on" ? " (current)" : ""} — every click and keystroke uses a real-looking event. Yellow 'pi-chrome is controlling Chrome' banner stays at the top of every Chrome window the whole session. Best when working a stubborn site for a long stretch.`,
+					`off${current === "off" ? " (current)" : ""} — always quiet. No banner, ever. Fast and unobtrusive, but some sites (sign-in pages, copy-to-clipboard buttons, file pickers, paywalls) will silently ignore the click.`,
+					`on${current === "on" ? " (current)" : ""} — every click and keystroke uses a real-looking event. A banner stays at the top of every Chrome window for the whole session, saying ‘Pi Chrome Connector started debugging this browser’. Best when working a stubborn site for a long stretch.`,
 					`status — just show me which mode is on right now.`,
 				];
 				const picked = await ctx.ui.select(
@@ -624,7 +624,7 @@ Usage rules:
 			if (target === "on" && current !== "on") {
 				const ok = await ctx.ui.confirm(
 					"Always use real-looking clicks?",
-					"Every click and keystroke pi-chrome sends will now look like a real human action to websites. This unlocks copy-to-clipboard buttons, sign-in pages, file pickers, fullscreen, autoplay, and most bot-protected sites.\n\nThe tradeoff: Chrome will pin a yellow bar at the top of every Chrome window saying 'pi-chrome is controlling Chrome'. The bar stays visible for the rest of your pi session (or until you switch back to auto/off). Clicking 'Cancel' on the bar interrupts pi-chrome.",
+					"Every click and keystroke pi-chrome sends will now look like a real human action to websites. This unlocks copy-to-clipboard buttons, sign-in pages, file pickers, fullscreen, autoplay, and most bot-protected sites.\n\nThe tradeoff: Chrome will pin a banner at the top of every Chrome window saying ‘Pi Chrome Connector started debugging this browser’. The banner stays visible for the rest of your pi session (or until you switch back to auto/off). Clicking ‘Cancel’ on the banner interrupts pi-chrome.",
 				);
 				if (!ok) {
 					ctx.ui.notify("Mode unchanged.", "info");
@@ -636,13 +636,13 @@ Usage rules:
 				const result = (await bridge.send("trusted.mode", { mode: target }, 5_000)) as { mode: string };
 				if (result.mode === "on") {
 					ctx.ui.notify(
-						"On. Every click and keystroke now looks real to websites. The yellow 'pi-chrome is controlling Chrome' banner will appear on every tab pi-chrome touches.",
+						"On. Every click and keystroke now looks real to websites. A banner saying ‘Pi Chrome Connector started debugging this browser’ will appear on every tab pi-chrome touches.",
 						"info",
 					);
 				} else if (result.mode === "off") {
-					ctx.ui.notify("Off. All clicks are quiet now, no yellow banner. Note: some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.", "info");
+				ctx.ui.notify("Off. All clicks are quiet now, no banner. Note: some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.", "info");
 				} else {
-					ctx.ui.notify("Auto. Clicks stay quiet by default; pi-chrome will only switch to real-looking clicks when a site rejects a quiet one. The yellow banner will appear only when that retry happens.", "info");
+					ctx.ui.notify("Auto. Clicks stay quiet by default; pi-chrome will only switch to real-looking clicks when a site rejects a quiet one. The Chrome banner will appear only when that retry happens.", "info");
 				}
 			} catch (error) {
 				ctx.ui.notify(`Couldn't switch mode: ${(error as Error).message}`, "warning");
@@ -849,7 +849,7 @@ Usage rules:
 		name: "chrome_click",
 		label: "Chrome Click",
 		description:
-			"Click a snapshot uid, CSS selector, or viewport coordinate. Default 'auto' mode runs synthetic DOM events first and silently retries with trusted CDP only when the click looks gated (no page change + affordance label matches play/copy/share/sign-in/etc, or a recent NotAllowedError). The yellow 'started debugging' banner appears only when the retry actually happens. Pass trusted=true to force CDP for this call (banner appears immediately). Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after the click.",
+			"Click a snapshot uid, CSS selector, or viewport coordinate. Default 'auto' mode runs synthetic DOM events first and silently retries with trusted CDP only when the click looks gated (no page change + affordance label matches play/copy/share/sign-in/etc, or a recent NotAllowedError). The 'started debugging' banner appears only when the retry actually happens. Pass trusted=true to force CDP for this call (banner appears immediately). Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after the click.",
 		promptSnippet: "Click page elements in Chrome by snapshot uid, selector, or viewport coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector after taking a snapshot." })),
@@ -1176,7 +1176,7 @@ Usage rules:
 		name: "chrome_tap",
 		label: "Chrome Tap (Touch)",
 		description:
-			"Dispatch a real browser-trusted touchstart/touchend tap via chrome.debugger (CDP Input.dispatchTouchEvent). Use for sites that gate on TouchEvent rather than MouseEvent (mobile-first PWAs, swipe carousels). Always uses the trusted CDP path — the yellow debugger banner appears.",
+			"Dispatch a real browser-trusted touchstart/touchend tap via chrome.debugger (CDP Input.dispatchTouchEvent). Use for sites that gate on TouchEvent rather than MouseEvent (mobile-first PWAs, swipe carousels). Always uses the trusted CDP path — the 'started debugging' banner appears.",
 		promptSnippet: "Tap (real touch) a Chrome element by snapshot uid, selector, or coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),

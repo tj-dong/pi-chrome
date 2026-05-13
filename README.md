@@ -69,7 +69,7 @@ pi-chrome v<version>
 
 By default, `chrome_*` clicks and keystrokes are **synthetic** DOM events (`event.isTrusted === false`). They drive React/Vue/Angular state correctly but **do not** satisfy Chrome's user-activation gates: clipboard write, fullscreen, file picker, and autoplay all need a real user gesture.
 
-pi-chrome can optionally route input through `chrome.debugger` (CDP `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent`) so each event arrives as `isTrusted=true`, satisfies user-activation, and bypasses site bot-detection that filters synthetic events. The tradeoff: Chrome pins a yellow *"Pi Chrome Connector started debugging this browser"* banner to the top of any debugged tab.
+pi-chrome can optionally route input through `chrome.debugger` (CDP `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent`) so each event arrives as `isTrusted=true`, satisfies user-activation, and bypasses site bot-detection that filters synthetic events. The tradeoff: Chrome pins a *"Pi Chrome Connector started debugging this browser"* banner to the top of any debugged tab.
 
 Usage:
 
