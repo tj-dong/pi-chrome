@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pi Chrome Connector",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "Lets Pi control tabs in Chrome via a local connector at 127.0.0.1.",
   "permissions": ["tabs", "scripting", "storage", "activeTab", "alarms", "webNavigation", "debugger"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:17318/*"],

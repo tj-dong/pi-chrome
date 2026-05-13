@@ -367,19 +367,20 @@ async function trustedScroll(params) {
   const x = resolved.rect ? resolved.rect.left + Math.min(resolved.rect.width, 800) / 2 : resolved.x;
   const y = resolved.rect ? resolved.rect.top + Math.min(resolved.rect.height, 600) / 2 : resolved.y;
   const totalY = params.deltaY || 0, totalX = params.deltaX || 0;
-  // Cap per-step delta so IntersectionObserver / scroll-driven animations get gradient samples.
-  // Real wheel notches ~50-120px; we aim ~40-90.
-  const MAX_STEP = 80;
-  const minStepsByDelta = Math.ceil(Math.max(Math.abs(totalY), Math.abs(totalX)) / MAX_STEP);
-  const n = Math.max(6, Math.min(60, params.steps || Math.max(minStepsByDelta, 12)));
-  // Momentum shape: ramp-up, plateau, decay. Each weight peaked mid-sequence then tapers.
+  // Per-event delta cap so IntersectionObserver / scroll-driven animations get gradient samples.
+  // A real wheel notch is ~50-120px; we aim for the lower end so visibility transitions are visible.
+  const MAX_STEP = 60;
+  const peak = Math.max(Math.abs(totalY), Math.abs(totalX));
+  // We weight events with mild front-loading. The peak weight = 1.5 / n (vs uniform 1/n), so the
+  // first event is ~1.5× average. Choose n so even the peak event stays under MAX_STEP.
+  const minN = Math.ceil(peak * 1.5 / MAX_STEP);
+  const n = Math.max(6, Math.min(80, params.steps || Math.max(minN, 12)));
+  // Front-loaded but smooth weights: w[i] = 1 + 0.5 * (1 - i/(n-1)) so the first event has
+  // weight 1.5, the last has 1.0, average ~1.25; redistribution stays predictable.
   const w = [];
   for (let i = 0; i < n; i++) {
     const t = i / Math.max(1, n - 1);
-    // bell-ish curve biased earlier so motion starts strong then decays (like a trackpad flick).
-    const base = Math.sin(Math.min(1, t * 1.4) * Math.PI);
-    const decay = Math.pow(1 - t * 0.6, 2);
-    w.push(0.2 + base * 0.8 * decay);
+    w.push(1 + 0.5 * (1 - t));
   }
   const sumW = w.reduce((a, b) => a + b, 0);
   for (let i = 0; i < n; i++) {
@@ -387,8 +388,8 @@ async function trustedScroll(params) {
     await cdp(tab.id, "Input.dispatchMouseEvent", {
       type: "mouseWheel", x, y, deltaX: dx, deltaY: dy, pointerType: "mouse",
     });
-    // Sleep ~one frame+ so IntersectionObserver / rAF samples can run between events.
-    await sleep(rng(22, 52));
+    // Sleep one+ frame so IntersectionObserver / rAF samples can run between events.
+    await sleep(rng(22, 48));
   }
   return { trusted: true, deltaX: totalX, deltaY: totalY, steps: n };
 }
