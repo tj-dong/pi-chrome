@@ -1,11 +1,11 @@
 {
 	"name": "pi-chrome",
-	"version": "0.14.9",
+	"version": "0.15.0",
 	"scripts": {
 		"version": "node scripts/sync-manifest-version.js",
 		"prepublishOnly": "node scripts/sync-manifest-version.js"
 	},
-	"description": "The de-facto browser automation toolkit for Pi agents. Drive your existing logged-in Chrome — no re-login, no throwaway profile, no CDP. 20+ tools (click, type, navigate, screenshot, network capture, file upload, drag, scroll, touch) + honest result envelopes + a built-in benchmark suite.",
+	"description": "Give a Pi agent your real, signed-in Chrome. No CDP, no throwaway profile, no re-login. 20+ tools (click, type, navigate, screenshot, network capture, file upload, drag, touch) with honest result envelopes — and a built-in browser-control benchmark suite.",
 	"keywords": [
 		"pi",
 		"pi-package",
@@ -36,6 +36,7 @@
 		"stagehand-alternative"
 	],
 	"license": "MIT",
+	"author": "tianrendong (Earendil Inc.)",
 	"homepage": "https://github.com/tianrendong/pi-chrome#readme",
 	"repository": {
 		"type": "git",
