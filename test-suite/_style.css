@@ -2,3 +2,30 @@ body { font: 14px system-ui, sans-serif; margin: 0; background: #1a1a1a; color: 
 main { padding: 24px; max-width: 720px; }
 code { background:#222;padding:1px 4px;border-radius:3px }
 a { color: #6cf; }
+button, input, select { font: 14px system-ui, sans-serif; }
+button { padding: 7px 11px; border-radius: 6px; border: 1px solid #555; background: #262626; color: #eee; cursor:pointer; }
+button:hover { background:#333; }
+input, select { padding: 6px 8px; border-radius: 6px; border: 1px solid #555; background:#111; color:#eee; }
+table { border-collapse: collapse; width: 100%; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+th, td { border-bottom: 1px solid #333; padding: 8px; vertical-align: top; text-align:left; }
+th { position: sticky; top: 0; background:#151515; z-index:1; }
+tr.ok { background: rgba(31,122,31,.08); }
+tr.mismatch { background: rgba(170,17,17,.12); }
+tr.conditional { background: rgba(118,82,11,.12); }
+.panel { background:#202020; border:1px solid #333; border-radius:10px; padding:12px; margin:16px 0; }
+.controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+.hint, .notes, .reason { color:#aaa; font-size:12px; margin-top:4px; }
+.summary { display:flex; flex-wrap:wrap; gap:8px; margin: 14px 0; }
+.pill { display:inline-block; border-radius:999px; padding:2px 8px; font-size:12px; font-weight:700; background:#444; color:#fff; }
+.pass { background:#1f7a1f; }
+.fail { background:#a11; }
+.skip, .conditional { background:#76520b; }
+.warn { background:#6b5d00; }
+.pending { background:#444; }
+.expected { background:#2b4b6b; }
+.risk { color:#ffd479; }
+.code, pre { background:#111; color:#eee; padding:12px; border-radius:6px; overflow:auto; }
+.copy-fallback { display:none; width:100%; min-height:180px; margin-top:10px; font:12px ui-monospace, SFMono-Regular, Menlo, monospace; background:#111; color:#eee; border:1px solid #555; border-radius:6px; padding:10px; }
+.copy-fallback[data-copied="true"] { border-color:#1f7a1f; }
+.copy-fallback[data-copied="false"] { border-color:#a11; }
+details summary { cursor:pointer; color:#9cf; }

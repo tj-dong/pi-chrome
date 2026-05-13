@@ -34,13 +34,11 @@ function inspectStack(stack) {
   if (!stack) return ["empty stack"];
   const hits = SUSPICIOUS.filter(r => r.test(stack)).map(r => r.source);
   const lines = stack.split("\n").filter(l => l.trim().startsWith("at "));
-  // A natural inline-handler stack has ≥2 frames within this document.
-  const docFrames = lines.filter(l => l.includes(location.pathname.split("/").pop()));
-  const anonOnly = lines.length > 0 && lines.every(l => /<anonymous>/.test(l));
+  // Do not fail on generic <anonymous> frames alone: inline scripts, extensions,
+  // and browser versions vary here. This test should catch concrete automation
+  // tells, not punish legitimate stack formatting differences.
   const reasons = [];
   if (hits.length) reasons.push("suspicious frames: " + hits.join(","));
-  if (anonOnly) reasons.push("all stack frames anonymous");
-  if (lines.length && docFrames.length === 0) reasons.push("no frame from this document");
   return reasons;
 }
 

@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>33 network and console capture</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: click button. Page emits console messages and performs a fetch. Benchmark harness should verify <code>chrome_list_console_messages</code> and <code>chrome_list_network_requests</code> captured them.</p>
+  <button id="go" style="padding:16px 24px;font-size:18px">Emit console + fetch</button>
+  <pre id="rep" style="font:12px monospace;background:#111;color:#eee;padding:12px;border-radius:6px"></pre>
+</main>
+<script>
+Challenge.init({ id: "network-console-capture", instructions: "clear capture, click, then inspect console/network tools" });
+document.getElementById("go").addEventListener("click", async (e) => {
+  console.log("pi-chrome-benchmark-console", { clicked: true, trusted: e.isTrusted });
+  console.warn("pi-chrome-benchmark-warning");
+  let data;
+  try {
+    const res = await fetch("data:application/json,%7B%22ok%22%3Atrue%2C%22source%22%3A%22pi-chrome-benchmark%22%7D");
+    data = await res.json();
+  } catch (err) {
+    return Challenge.fail("fetch failed: " + err.message);
+  }
+  document.getElementById("rep").textContent = JSON.stringify(data, null, 2);
+  Challenge.log("fetch-result", data);
+  if (data && data.ok && data.source === "pi-chrome-benchmark") {
+    Challenge.pass("page fetch completed; verify tool-level console/network capture separately");
+  } else {
+    Challenge.fail("unexpected fetch payload: " + JSON.stringify(data));
+  }
+});
+</script>
+</body>

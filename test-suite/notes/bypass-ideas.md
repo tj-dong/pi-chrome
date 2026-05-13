@@ -1,9 +1,12 @@
-# What it would take to PASS each challenge
+# Historical bypass notes
 
-`pi-chrome` runs through a content-script bridge, not CDP. That limits the
-solution space — most "real-event" tricks need the chrome.debugger API or
-`chrome.input.synthesizeMouseEvent`. The notes below mark which are reachable
-with the current manifest and which require new permissions.
+This file predates the current `trusted:true` / `chrome.debugger` path and is
+kept as design history. For current benchmark expectations, recipes, and
+capability notes, use `../manifest.json`.
+
+Older context: `pi-chrome` originally ran mostly through a content-script bridge.
+That limited the solution space — most "real-event" tricks needed the
+`chrome.debugger` API or `chrome.input.synthesizeMouseEvent`.
 
 ## 01–02 isTrusted click / keyboard
 **Hard.** `Event.isTrusted` is true only for events the browser dispatched

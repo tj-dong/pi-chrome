@@ -185,12 +185,72 @@ function cdpRaw(tabId, method, params) {
 // chrome.debugger.attach can stay cached in attachedTabs even after Chrome killed
 // the session (tab nav, devtools opened/closed, etc). Recover by detaching the
 // stale entry and re-attaching, then retry the command once.
+// Find foreign chrome-extension targets currently anchored to the tab. Password managers,
+// autofill helpers, and other input-attached extensions create type:"other" CDP targets
+// whose URL is chrome-extension://<otherId>/...  When that target is in focus, CDP refuses
+// our Input.dispatchMouseEvent calls with "Cannot access a chrome-extension:// URL of
+// different extension" — surfacing a cryptic error to the user.
+async function findForeignExtensionTargets() {
+  try {
+    const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || [])));
+    return targets.filter((t) => {
+      const url = String(t.url || "");
+      if (!url.startsWith("chrome-extension://")) return false;
+      if (t.extensionId === chrome.runtime.id) return false;
+      return true;
+    });
+  } catch {
+    return [];
+  }
+}
+
+function extractForeignExtId(targets) {
+  for (const t of targets) {
+    if (t.extensionId && t.extensionId !== chrome.runtime.id) return t.extensionId;
+    const m = String(t.url || "").match(/chrome-extension:\/\/([a-p]+)\//);
+    if (m && m[1] !== chrome.runtime.id) return m[1];
+  }
+  return null;
+}
+
+async function dismissOverlayViaEscape(tabId) {
+  // Esc routes through key dispatcher (target-by-focus), not by mouse coordinates, so it
+  // works even when a foreign chrome-extension popup is intercepting pointer events.
+  try {
+    await cdpRaw(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await cdpRaw(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    await sleep(120);
+  } catch {}
+}
+
 async function cdp(tabId, method, params) {
   try {
     return await cdpRaw(tabId, method, params);
   } catch (error) {
     const msg = String(error?.message || error);
     const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
+    const isForeignExtBlock = /Cannot access a chrome-extension:\/\/ URL of different extension/i.test(msg);
+    if (isForeignExtBlock && /Input\./.test(method)) {
+      // Foreign chrome-extension popup (autofill, password manager) is hijacking input.
+      // Try once: dismiss via Esc, then retry.
+      const before = await findForeignExtensionTargets();
+      recordAttachEvent({ kind: "foreign-ext-detected", tabId, method, foreignExtId: extractForeignExtId(before), targetCount: before.length });
+      await dismissOverlayViaEscape(tabId);
+      try {
+        return await cdpRaw(tabId, method, params);
+      } catch (retryErr) {
+        const retryMsg = String(retryErr?.message || retryErr);
+        if (/Cannot access a chrome-extension:\/\/ URL of different extension/i.test(retryMsg)) {
+          const after = await findForeignExtensionTargets();
+          const id = extractForeignExtId(after) || extractForeignExtId(before) || "unknown";
+          throw new Error(
+            `Another Chrome extension (${id}) has an input overlay on this page (e.g. a password manager / autofill popup). \n` +
+            `pi-chrome tried to dismiss it with Escape but it reappeared. Disable that extension on this page, focus the field via Tab instead of clicking, or run /chrome quiet off so the agent uses synthetic input here.`,
+          );
+        }
+        throw retryErr;
+      }
+    }
     if (!isStale) throw error;
     attachedTabs.delete(tabId);
     await chrome.debugger.attach({ tabId }, CDP_VERSION).catch(() => undefined);

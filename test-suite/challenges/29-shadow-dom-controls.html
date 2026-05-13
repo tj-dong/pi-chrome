@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>29 shadow DOM controls</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: discover controls inside an <code>open</code> Shadow DOM, click the button, then type <code>shadow-ok</code> into the shadow input.</p>
+  <div id="host"></div>
+</main>
+<script>
+Challenge.init({ id: "shadow-dom-controls", instructions: "click shadow button, type 'shadow-ok' in shadow input" });
+const host = document.getElementById("host");
+const root = host.attachShadow({ mode: "open" });
+root.innerHTML = `
+  <style>
+    .card { border:1px solid #555; border-radius:8px; padding:16px; background:#222; display:inline-block; }
+    button,input { font:16px system-ui; padding:8px 10px; margin:6px; }
+  </style>
+  <div class="card" role="group" aria-label="Shadow test controls">
+    <button id="shadowBtn">Arm shadow form</button>
+    <input id="shadowInput" aria-label="Shadow value" placeholder="shadow-ok" disabled>
+    <span id="status">waiting</span>
+  </div>
+`;
+const btn = root.getElementById("shadowBtn");
+const input = root.getElementById("shadowInput");
+const status = root.getElementById("status");
+let armed = false;
+btn.addEventListener("click", (e) => {
+  armed = true;
+  input.disabled = false;
+  input.focus();
+  status.textContent = `armed; click trusted=${e.isTrusted}`;
+  Challenge.log("shadow-click", { isTrusted: e.isTrusted });
+});
+input.addEventListener("input", (e) => {
+  Challenge.log("shadow-input", { value: input.value, isTrusted: e.isTrusted });
+  if (input.value !== "shadow-ok") return;
+  if (!armed) return Challenge.fail("input reached target value before shadow button click armed the form");
+  Challenge.pass("shadow button clicked and shadow input filled");
+});
+</script>
+</body>

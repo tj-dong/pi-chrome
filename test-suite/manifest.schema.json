@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pi-chrome benchmark manifest",
+  "description": "Manifest for browser-control benchmark pages. Recipes are canonical intent, not guaranteed raw tool JSON: runners may need to adapt descriptive selectors (frame/shadow) and expand path placeholders such as $PWD before invoking tools.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "file", "category", "goal", "expected", "recipe"],
+    "additionalProperties": true,
+    "properties": {
+      "id": { "type": "string" },
+      "file": { "type": "string" },
+      "category": { "$ref": "#/$defs/category" },
+      "goal": { "type": "string" },
+      "expected": {
+        "type": "object",
+        "description": "Expected verdict by execution mode. CONDITIONAL means prerequisites, browser policy, hardware, or missing tool primitives decide outcome.",
+        "required": ["synthetic", "trusted", "manual"],
+        "properties": {
+          "synthetic": { "$ref": "#/$defs/outcome" },
+          "trusted": { "$ref": "#/$defs/outcome" },
+          "manual": { "$ref": "#/$defs/outcome" }
+        }
+      },
+      "manualBaseline": {
+        "description": "Whether human baseline has been explicitly verified in this repo/environment.",
+        "enum": ["unverified", "verified"]
+      },
+      "manualBaselineVerifiedAt": { "type": "string", "format": "date-time" },
+      "recipe": {
+        "type": "array",
+        "description": "Ordered tool intent. Params may include descriptive selectors (e.g. frame/shadow notation) or path placeholders for runners to adapt.",
+        "items": {
+          "type": "object",
+          "required": ["tool", "params"],
+          "properties": {
+            "tool": { "type": "string" },
+            "params": {
+              "type": "object",
+              "description": "Tool params. For upload recipes, paths are strings after runner expansion; $PWD means repository working directory."
+            }
+          }
+        }
+      },
+      "prerequisites": { "type": "array", "items": { "type": "string" } },
+      "notes": { "type": "array", "items": { "type": "string" } },
+      "verdictDelayMs": { "type": "number" },
+      "flakeRisk": { "enum": ["low", "medium", "high"] }
+    }
+  },
+  "$defs": {
+    "outcome": { "enum": ["PASS", "FAIL", "SKIP", "WARN", "CONDITIONAL"] },
+    "category": {
+      "enum": [
+        "activation-gates",
+        "agent-safety",
+        "clipboard",
+        "dom-complexity",
+        "drag-drop",
+        "editing",
+        "files",
+        "fingerprint",
+        "focus-keyboard",
+        "frames",
+        "frameworks",
+        "hover",
+        "keyboard",
+        "native-controls",
+        "observability",
+        "pointer-humanization",
+        "scroll",
+        "scroll-visibility",
+        "timing",
+        "touch",
+        "trusted-input"
+      ]
+    }
+  }
+}

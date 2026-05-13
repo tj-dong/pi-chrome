@@ -1,90 +1,157 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>pi-chrome anti-automation test suite</title>
+<title>pi-chrome browser-control benchmark</title>
 <link rel="stylesheet" href="_style.css">
 <body>
-<main style="max-width:1100px">
-<h1>pi-chrome anti-automation test suite</h1>
-<p>Each row links to a challenge page. Open it, drive the interaction with <code>chrome_*</code> tools,
-then read <code>window.__verdict</code> via <code>chrome_evaluate</code>. Use the "Run all" button below
-to poll every challenge's verdict into a single table.</p>
+<main style="max-width:1280px">
+<h1>pi-chrome browser-control benchmark</h1>
+<p>This benchmark measures how well Chrome-control tools let agents do real browser work: DOM discovery, trusted input, keyboard/focus, scroll, drag/drop, files, frames, clipboard, and observability.</p>
 
-<table id="tbl" style="border-collapse:collapse;width:100%;font:13px monospace">
-  <thead><tr><th align=left>id</th><th align=left>file</th><th align=left>verdict</th><th align=left>open</th></tr></thead>
+<section class="panel">
+  <div class="controls">
+    <button id="refresh">Refresh verdicts</button>
+    <button id="clear">Clear local verdicts</button>
+    <button id="copy">Copy JSON report</button>
+    <label>Filter <input id="filter" placeholder="category, id, expected..." /></label>
+    <label>Mode
+      <select id="mode">
+        <option value="trusted">trusted</option>
+        <option value="synthetic">synthetic</option>
+        <option value="manual">manual</option>
+      </select>
+    </label>
+  </div>
+  <p class="hint">Open a row, drive it with <code>chrome_*</code> tools, then return here. Verdicts are read from <code>localStorage</code>. Expected outcomes come from <code>manifest.json</code>.</p>
+  <textarea id="copyFallback" class="copy-fallback" readonly aria-label="JSON report fallback"></textarea>
+</section>
+
+<div id="summary" class="summary"></div>
+<table id="tbl">
+  <thead>
+    <tr>
+      <th>id</th><th>category</th><th>verdict</th><th>expected</th><th>baseline</th><th>risk</th><th>goal / notes</th><th>open</th>
+    </tr>
+  </thead>
   <tbody></tbody>
 </table>
 
-<p><button id="poll" style="margin-top:12px;padding:8px 14px">Refresh verdicts from any tab on this origin</button></p>
-
-<h2>How to drive from pi</h2>
-<pre style="background:#111;padding:12px;border-radius:6px;overflow:auto">
-# 1. Start static server in test-suite/
-python3 -m http.server 8765
-
-# 2. From pi:
-chrome_navigate http://127.0.0.1:8765/challenges/01-is-trusted-click.html
-chrome_click selector=#go
-chrome_evaluate JSON.stringify({v:window.__verdict, r:window.__reason})
-</pre>
-
+<h2>Agent run loop</h2>
+<pre class="code">python3 -m http.server 8765
+# For each manifest entry:
+# 1. chrome_navigate http://127.0.0.1:8765/&lt;file&gt;
+# 2. chrome_snapshot before acting; prefer uid selectors.
+# 3. Execute recipe with selected mode, adapting descriptive frame/shadow selectors to tool uids.
+# 4. chrome_evaluate JSON.stringify({v:window.__verdict,r:window.__reason,e:window.__events?.slice(-20)})
+# 5. Compare verdict to manifest.expected[mode]; CONDITIONAL means inspect prerequisites/notes.</pre>
+</main>
 <script>
-const challenges = [
-  ["is-trusted-click",      "challenges/01-is-trusted-click.html"],
-  ["is-trusted-keyboard",   "challenges/02-is-trusted-keyboard.html"],
-  ["webdriver-flag",        "challenges/03-webdriver-flag.html"],
-  ["mouse-entropy",         "challenges/04-mouse-entropy.html"],
-  ["event-timing",          "challenges/05-event-timing.html"],
-  ["click-coordinates",     "challenges/06-click-coordinates.html"],
-  ["pointer-properties",    "challenges/07-pointer-properties.html"],
-  ["keyboard-cadence",      "challenges/08-keyboard-cadence.html"],
-  ["composition-input",     "challenges/09-composition-input.html"],
-  ["user-activation",       "challenges/10-user-activation.html"],
-  ["honeypot",              "challenges/11-honeypot.html"],
-  ["fingerprint",           "challenges/12-fingerprint.html"],
-  ["focus-order",           "challenges/13-focus-order.html"],
-  ["wheel-scroll",          "challenges/14-wheel-scroll.html"],
-  ["drag-drop-datatransfer", "challenges/15-drag-drop-datatransfer.html"],
-  ["contenteditable-selection", "challenges/16-contenteditable-selection.html"],
-  ["paste-clipboard",       "challenges/17-paste-clipboard.html"],
-  ["native-select",         "challenges/18-native-select.html"],
-  ["hover-dwell",           "challenges/19-hover-dwell.html"],
-  ["react-value-tracker",   "challenges/20-react-value-tracker.html"],
-  ["keyboard-modifiers",    "challenges/21-keyboard-modifiers.html"],
-  ["touch-events",          "challenges/22-touch-events.html"],
-  ["stack-trace-fingerprint", "challenges/23-stack-trace-fingerprint.html"],
-  ["viewport-edge-clicks",  "challenges/24-viewport-edge-clicks.html"],
-  ["pointer-continuity",    "challenges/25-pointer-continuity.html"],
-  ["mousemove-rate",        "challenges/26-mousemove-rate.html"],
-  ["scroll-momentum",       "challenges/27-scroll-momentum.html"],
-  ["intersection-visibility", "challenges/28-intersection-visibility.html"],
-];
+let manifest = [];
 const tbody = document.querySelector("#tbl tbody");
-const rowFor = {};
-for (const [id, file] of challenges) {
-  const tr = document.createElement("tr");
-  tr.innerHTML = `<td>${id}</td><td>${file}</td><td class=v>—</td><td><a target=_blank href="${file}">open</a></td>`;
-  tbody.appendChild(tr);
-  rowFor[id] = tr;
-}
+const modeEl = document.getElementById("mode");
+const filterEl = document.getElementById("filter");
 
-// localStorage rendezvous: each challenge page writes its verdict on change.
+function verdictFor(id) {
+  const raw = localStorage.getItem("pi-chrome-suite:" + id);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+function classFor(v) {
+  if (!v) return "pending";
+  return String(v).toLowerCase();
+}
+function expectedClass(actual, expected) {
+  if (!actual) return "pending";
+  if (expected === "CONDITIONAL") return actual === "PASS" ? "ok" : "conditional";
+  return actual === expected ? "ok" : "mismatch";
+}
+function report() {
+  const mode = modeEl.value;
+  return manifest.map(m => {
+    const v = verdictFor(m.id);
+    return {
+      id: m.id,
+      category: m.category,
+      file: m.file,
+      verdict: v?.verdict ?? "PENDING",
+      reason: v?.reason ?? [],
+      expected: m.expected?.[mode] ?? "—",
+      timestamp: v?.ts ?? null,
+      goal: m.goal,
+      prerequisites: m.prerequisites ?? [],
+      notes: m.notes ?? []
+    };
+  });
+}
 function paint() {
-  for (const [id] of challenges) {
-    const raw = localStorage.getItem("pi-chrome-suite:" + id);
-    if (!raw) continue;
-    try {
-      const { verdict, reason } = JSON.parse(raw);
-      const td = rowFor[id].querySelector(".v");
-      td.textContent = verdict + (reason?.length ? "  — " + reason.join(" / ") : "");
-      td.style.background = verdict === "PASS" ? "#1f7a1f" : verdict === "FAIL" ? "#a11" : "#444";
-      td.style.color = "#fff";
-    } catch {}
+  const q = filterEl.value.trim().toLowerCase();
+  const mode = modeEl.value;
+  tbody.innerHTML = "";
+  const rows = report();
+  const counts = rows.reduce((acc, r) => (acc[r.verdict] = (acc[r.verdict] || 0) + 1, acc), {});
+  const mismatches = rows.filter(r => r.verdict !== "PENDING" && r.expected !== "CONDITIONAL" && r.expected !== "—" && r.verdict !== r.expected).length;
+  document.getElementById("summary").innerHTML = `
+    <span class="pill pass">PASS ${counts.PASS || 0}</span>
+    <span class="pill fail">FAIL ${counts.FAIL || 0}</span>
+    <span class="pill skip">SKIP ${counts.SKIP || 0}</span>
+    <span class="pill warn">WARN ${counts.WARN || 0}</span>
+    <span class="pill pending">PENDING ${counts.PENDING || 0}</span>
+    <span class="pill ${mismatches ? "fail" : "pass"}">unexpected ${mismatches}</span>
+  `;
+  for (const m of manifest) {
+    const v = verdictFor(m.id);
+    const verdict = v?.verdict ?? "PENDING";
+    const expected = m.expected?.[mode] ?? "—";
+    const hay = JSON.stringify({ id:m.id, category:m.category, verdict, expected, goal:m.goal, notes:m.notes }).toLowerCase();
+    if (q && !hay.includes(q)) continue;
+    const tr = document.createElement("tr");
+    tr.className = expectedClass(verdict, expected);
+    const reason = (v?.reason || []).join(" / ");
+    const notes = [...(m.prerequisites || []).map(x => "pre: " + x), ...(m.notes || [])].join("; ");
+    tr.innerHTML = `
+      <td><code>${m.id}</code></td>
+      <td>${m.category || "—"}</td>
+      <td><span class="pill ${classFor(verdict)}">${verdict}</span><div class="reason">${escapeHtml(reason)}</div></td>
+      <td><span class="pill expected">${expected}</span></td>
+      <td><span class="pill ${m.manualBaseline === "verified" ? "pass" : "pending"}">${m.manualBaseline || "unverified"}</span></td>
+      <td>${m.flakeRisk ? `<span class="risk">${m.flakeRisk}</span>` : ""}</td>
+      <td><div>${escapeHtml(m.goal || "")}</div><div class="notes">${escapeHtml(notes)}</div><details><summary>recipe</summary><pre>${escapeHtml(JSON.stringify(m.recipe || [], null, 2))}</pre></details></td>
+      <td><a target="_blank" href="${m.file}">open</a></td>
+    `;
+    tbody.appendChild(tr);
   }
 }
-document.getElementById("poll").addEventListener("click", paint);
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+async function init() {
+  manifest = await fetch("manifest.json", { cache: "no-store" }).then(r => r.json());
+  paint();
+}
+document.getElementById("refresh").addEventListener("click", paint);
+document.getElementById("clear").addEventListener("click", () => {
+  if (!confirm("Clear pi-chrome-suite verdicts for this origin?")) return;
+  for (const m of manifest) localStorage.removeItem("pi-chrome-suite:" + m.id);
+  paint();
+});
+document.getElementById("copy").addEventListener("click", async () => {
+  const text = JSON.stringify({ mode: modeEl.value, generatedAt: new Date().toISOString(), rows: report() }, null, 2);
+  const box = document.getElementById("copyFallback");
+  box.value = text;
+  box.style.display = "block";
+  box.focus();
+  box.select();
+  let copied = false;
+  try { await navigator.clipboard.writeText(text); copied = true; } catch {}
+  if (!copied) {
+    try { copied = document.execCommand("copy"); } catch {}
+  }
+  box.dataset.copied = copied ? "true" : "false";
+  console.log(text);
+});
+modeEl.addEventListener("change", paint);
+filterEl.addEventListener("input", paint);
 window.addEventListener("storage", paint);
 setInterval(paint, 1000);
-paint();
+init();
 </script>
-</main>
 </body>

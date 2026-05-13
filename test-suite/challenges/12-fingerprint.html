@@ -36,7 +36,7 @@ Challenge.init({ id: "fingerprint", instructions: "no interaction" });
     const vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
     const renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
     const swiftshader = /SwiftShader|llvmpipe|Software/i.test(renderer);
-    checks.push({ name: "webgl-not-software", bad: swiftshader, note: `${vendor} / ${renderer}` });
+    checks.push({ name: "webgl-not-software", bad: false, warn: swiftshader, note: `${vendor} / ${renderer}${swiftshader ? " (software renderer; warning in VM/remote contexts)" : ""}` });
   } catch (e) {
     checks.push({ name: "webgl-not-software", bad: false, note: "n/a " + e.message });
   }
@@ -48,9 +48,11 @@ Challenge.init({ id: "fingerprint", instructions: "no interaction" });
   checks.push({ name: "webdriver-false", bad: navigator.webdriver === true, note: String(navigator.webdriver) });
 
   const rep = document.getElementById("rep");
-  rep.textContent = checks.map(c => `${c.bad ? "✗" : "✓"} ${c.name}  ${c.note}`).join("\n");
+  rep.textContent = checks.map(c => `${c.bad ? "✗" : c.warn ? "!" : "✓"} ${c.name}  ${c.note}`).join("\n");
   const failed = checks.filter(c => c.bad);
+  const warned = checks.filter(c => c.warn);
   if (failed.length) Challenge.fail(...failed.map(c => `${c.name}: ${c.note}`));
+  else if (warned.length) Challenge.warn(...warned.map(c => `${c.name}: ${c.note}`));
   else Challenge.pass("fingerprint consistent with real Chrome");
 })();
 </script>

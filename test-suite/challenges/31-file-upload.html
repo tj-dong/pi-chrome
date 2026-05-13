@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>31 file upload</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: attach <code>test-suite/fixtures/pi-chrome-upload.txt</code>. Page reads name and contents from the File object.</p>
+  <input id="file" type="file" aria-label="Upload fixture file" style="font-size:16px;padding:10px;border:1px solid #555;border-radius:6px">
+  <pre id="rep" style="font:12px monospace;background:#111;color:#eee;padding:12px;border-radius:6px"></pre>
+</main>
+<script>
+Challenge.init({ id: "file-upload", instructions: "upload fixtures/pi-chrome-upload.txt" });
+const input = document.getElementById("file");
+const rep = document.getElementById("rep");
+input.addEventListener("change", async (e) => {
+  const f = input.files && input.files[0];
+  if (!f) return Challenge.fail("change fired but input.files[0] missing");
+  const text = await f.text();
+  const info = { name: f.name, size: f.size, type: f.type, trusted: e.isTrusted, text };
+  rep.textContent = JSON.stringify(info, null, 2);
+  Challenge.log("file-change", info);
+  const bad = [];
+  if (f.name !== "pi-chrome-upload.txt") bad.push(`file.name=${f.name}`);
+  if (text !== "pi-chrome upload fixture\n") bad.push(`file content=${JSON.stringify(text)}`);
+  if (bad.length) Challenge.fail(...bad);
+  else Challenge.pass(`uploaded ${f.name}; change.isTrusted=${e.isTrusted}`);
+});
+</script>
+</body>

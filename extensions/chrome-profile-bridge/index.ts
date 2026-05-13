@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -380,6 +379,10 @@ class ChromeProfileBridge {
 const tabActionValues = ["list", "new", "activate", "close", "version"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
+
+function StringEnum<T extends readonly [string, ...string[]]>(values: T) {
+	return Type.Union(values.map((value) => Type.Literal(value)) as [ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[]]);
+}
 
 export default function (pi: ExtensionAPI): void {
 	const globalState = globalThis as typeof globalThis & {

@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>32 keyboard tab navigation</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: use keyboard only. Click Start, then Tab through fields, type <code>one</code>, <code>two</code>, <code>three</code>, Tab to Submit, press Enter.</p>
+  <button id="start">Start here</button>
+  <form id="f" style="margin-top:16px;display:grid;gap:10px;max-width:360px">
+    <label>First <input id="a" name="a" autocomplete="off"></label>
+    <label>Second <input id="b" name="b" autocomplete="off"></label>
+    <label>Third <input id="c" name="c" autocomplete="off"></label>
+    <button id="submit" type="submit">Submit</button>
+  </form>
+  <pre id="rep" style="font:12px monospace;background:#111;color:#eee;padding:12px;border-radius:6px"></pre>
+</main>
+<script>
+Challenge.init({ id: "keyboard-tab-navigation", instructions: "keyboard-only tab flow; submit with Enter" });
+const ids = ["start", "a", "b", "c", "submit"];
+const focusLog = [];
+const keyLog = [];
+const rep = document.getElementById("rep");
+for (const id of ids) {
+  const el = document.getElementById(id);
+  el.addEventListener("focus", (e) => {
+    focusLog.push({ id, t: e.timeStamp });
+    rep.textContent = JSON.stringify({ focusLog, keyLog }, null, 2);
+  });
+  el.addEventListener("keydown", (e) => {
+    keyLog.push({ id, key: e.key, trusted: e.isTrusted, t: e.timeStamp });
+  });
+}
+let sawPointerAfterStart = false;
+document.addEventListener("pointerdown", (e) => {
+  if (e.target && e.target.id !== "start") sawPointerAfterStart = true;
+});
+document.getElementById("start").addEventListener("click", () => setTimeout(() => document.getElementById("start").focus(), 0));
+document.getElementById("f").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const vals = {
+    a: document.getElementById("a").value,
+    b: document.getElementById("b").value,
+    c: document.getElementById("c").value
+  };
+  const bad = [];
+  if (vals.a !== "one" || vals.b !== "two" || vals.c !== "three") bad.push(`values=${JSON.stringify(vals)}`);
+  const seq = focusLog.map(x => x.id).join(">");
+  for (const id of ids) if (!focusLog.some(x => x.id === id)) bad.push(`never focused ${id}`);
+  const enter = keyLog.find(x => x.id === "submit" && x.key === "Enter");
+  if (!enter) bad.push("no Enter keydown on submit button");
+  else if (!enter.trusted) bad.push("Enter on submit isTrusted=false");
+  const tabCount = keyLog.filter(x => x.key === "Tab").length;
+  if (tabCount < 4) bad.push(`only ${tabCount} Tab keydowns (need ≥4)`);
+  if (sawPointerAfterStart) bad.push("pointerdown after Start; flow was not keyboard-only");
+  Challenge.log("keyboard-submit", { vals, seq, keyLog, sawPointerAfterStart });
+  if (bad.length) Challenge.fail(...bad);
+  else Challenge.pass(`keyboard-only focus sequence ${seq}`);
+});
+</script>
+</body>

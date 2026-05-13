@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.14.1",
+	"version": "0.14.2",
 	"description": "Drive your existing logged-in Chrome from Pi — no re-login, no throwaway profile, watch the agent work in real time (or toggle quiet background mode).",
 	"keywords": [
 		"pi-package",
@@ -24,8 +24,15 @@
 		]
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
 		"typebox": "*"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
 	}
 }

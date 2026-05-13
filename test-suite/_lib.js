@@ -17,7 +17,9 @@
     el.dataset.verdict = state.verdict;
     el.style.background =
       state.verdict === "PASS" ? "#1f7a1f" :
-      state.verdict === "FAIL" ? "#a11" : "#444";
+      state.verdict === "FAIL" ? "#a11" :
+      state.verdict === "SKIP" ? "#76520b" :
+      state.verdict === "WARN" ? "#6b5d00" : "#444";
     el.style.color = "#fff";
     const r = document.getElementById("__reason");
     if (r) r.textContent = state.reason.join("\n");
@@ -64,6 +66,22 @@
       document.title = `[FAIL] ${state.id}`;
       persist(); render();
     },
+    skip(...reasons) {
+      if (state.verdict === "FAIL" || state.verdict === "PASS") return;
+      state.verdict = "SKIP";
+      state.reason.push(...reasons.map((r) => "↷ " + r));
+      window.__verdict = state.verdict;
+      document.title = `[SKIP] ${state.id}`;
+      persist(); render();
+    },
+    warn(...reasons) {
+      if (state.verdict === "FAIL" || state.verdict === "PASS") return;
+      state.verdict = "WARN";
+      state.reason.push(...reasons.map((r) => "! " + r));
+      window.__verdict = state.verdict;
+      document.title = `[WARN] ${state.id}`;
+      persist(); render();
+    },
     log,
     state,
   };
@@ -72,7 +90,7 @@
     try {
       localStorage.setItem(
         "pi-chrome-suite:" + state.id,
-        JSON.stringify({ verdict: state.verdict, reason: state.reason, ts: Date.now() })
+        JSON.stringify({ id: state.id, verdict: state.verdict, reason: state.reason, events: state.events.slice(-50), ts: Date.now() })
       );
     } catch {}
   }

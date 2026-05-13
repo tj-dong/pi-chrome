@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>30 iframe targeting</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: interact with controls inside a same-origin iframe. Type <code>frame-ok</code> then click Submit inside the frame.</p>
+  <iframe id="ifr" title="same-origin challenge frame" style="width:520px;height:220px;border:1px solid #555;border-radius:8px;background:#fff"></iframe>
+</main>
+<script>
+Challenge.init({ id: "iframe-targeting", instructions: "type 'frame-ok' and click Submit inside iframe" });
+const frame = document.getElementById("ifr");
+frame.srcdoc = `<!doctype html><meta charset="utf-8">
+<style>body{font:16px system-ui;margin:24px;background:#202020;color:#eee}input,button{font:16px system-ui;padding:8px 10px;margin:6px}</style>
+<p>Inside frame: fill and submit.</p>
+<input id="insideText" aria-label="Frame value" placeholder="frame-ok">
+<button id="insideButton">Submit frame</button>
+<pre id="log"></pre>
+<script>
+  const input = document.getElementById('insideText');
+  const btn = document.getElementById('insideButton');
+  const log = document.getElementById('log');
+  let focused = false;
+  input.addEventListener('focus', () => { focused = true; parent.postMessage({ type:'frame-focus' }, '*'); });
+  input.addEventListener('input', e => parent.postMessage({ type:'frame-input', value: input.value, trusted: e.isTrusted }, '*'));
+  btn.addEventListener('click', e => {
+    const payload = { type:'frame-submit', value: input.value, focused, trusted: e.isTrusted };
+    log.textContent = JSON.stringify(payload, null, 2);
+    parent.postMessage(payload, '*');
+  });
+<\/script>`;
+window.addEventListener("message", (e) => {
+  if (!e.data || typeof e.data !== "object") return;
+  Challenge.log("frame-message", e.data);
+  if (e.data.type !== "frame-submit") return;
+  const bad = [];
+  if (e.data.value !== "frame-ok") bad.push(`iframe input value="${e.data.value}" (need frame-ok)`);
+  if (!e.data.focused) bad.push("iframe input was not focused before submit");
+  if (bad.length) Challenge.fail(...bad);
+  else Challenge.pass(`iframe controls reached; submit trusted=${e.data.trusted}`);
+});
+</script>
+</body>

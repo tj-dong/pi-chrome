@@ -1,8 +1,13 @@
-# pi-chrome anti-automation test suite
+# pi-chrome browser-control benchmark
 
-Static pages that each block a different automated-interaction signal. Drive them
-with the `chrome_*` tools to discover where the companion-extension's synthetic
-events still look like a bot, and to verify any humanization fixes.
+Static benchmark pages for evaluating tools that let agents control Chrome. The
+suite covers two related questions:
+
+1. **Can the agent complete normal browser work?** Forms, scroll containers,
+   contenteditable, files, frames, Shadow DOM, network/console inspection.
+2. **Does the interaction look like a human/browser action when sites care?**
+   `isTrusted`, user activation, pointer paths, key cadence, native controls,
+   drag/drop, touch, paste, and scroll momentum.
 
 ## Run
 
@@ -14,61 +19,120 @@ python3 -m http.server 8765
 
 Each challenge page exposes:
 
-- `window.__challenge` — short id
-- `window.__verdict` — `"PENDING" | "PASS" | "FAIL"`
-- `window.__reason` — array of strings, why it failed (or how it passed)
+- `window.__challenge` — id
+- `window.__verdict` — `"PENDING" | "PASS" | "FAIL" | "SKIP" | "WARN"`
+- `window.__reason` — array of reasons
 - `window.__events` — raw event log for forensics
 
-`PASS` means the page believes a real human did the thing.
-`FAIL` means the page caught the automation.
+`manifest.json` is the source of truth for benchmark metadata: category, goal,
+expected result per mode, prerequisites, flake risk, manual baseline status, and
+canonical tool recipe. `manifest.schema.json` documents the manifest shape.
+Recipes express tool intent; runners may need to adapt descriptive selectors
+(e.g. shadow/iframe notation) and expand path placeholders like `$PWD`.
 
-## Aggregate runner
+## Modes / expected outcomes
 
-`index.html` lists every challenge, loads each one in an iframe, lets you (or
-the agent) drive the interaction, and tallies verdicts.
+The same page can have different expected results depending on tool capability:
 
-Recommended agent flow:
+- `synthetic` — DOM-dispatched events / framework-aware setters. Fast and quiet.
+- `trusted` — browser-trusted input, usually via `chrome.debugger`/CDP. Can show
+  Chrome's debugging banner.
+- `manual` — human baseline in same browser/profile.
 
-1. `chrome_navigate` to `http://127.0.0.1:8765/`.
-2. For each challenge link, open it, run the listed interaction with the
-   `chrome_*` tools, then read `window.__verdict` / `window.__reason` via
-   `chrome_evaluate`.
-3. Compare against the manual baseline (do the same interaction by hand and
-   confirm `PASS`).
+Expected values in `manifest.json`:
 
-## Challenges
+- `PASS` / `FAIL` — deterministic target for that mode.
+- `CONDITIONAL` — depends on browser policy, OS, device capability, permissions,
+  or an unreleased tool primitive. Inspect `prerequisites`, `notes`, and
+  `flakeRisk`.
 
-| id | file | what it blocks |
-|----|------|----------------|
-| `is-trusted-click` | `challenges/01-is-trusted-click.html` | click handler ignores `event.isTrusted === false` |
-| `is-trusted-keyboard` | `challenges/02-is-trusted-keyboard.html` | input rejects if `keydown.isTrusted` false |
-| `webdriver-flag` | `challenges/03-webdriver-flag.html` | `navigator.webdriver` truthy / Chrome runtime quirks |
-| `mouse-entropy` | `challenges/04-mouse-entropy.html` | requires organic mousemove path before click |
-| `event-timing` | `challenges/05-event-timing.html` | rejects when pointerdown→pointerup gap < N ms or always-equal |
-| `click-coordinates` | `challenges/06-click-coordinates.html` | rejects clicks that land on exact element center |
-| `pointer-properties` | `challenges/07-pointer-properties.html` | demands pressure / non-zero movementX/Y / pointerId variety |
-| `keyboard-cadence` | `challenges/08-keyboard-cadence.html` | rejects same-tick `keydown`/`keyup` and missing per-char events |
-| `composition-input` | `challenges/09-composition-input.html` | listens for native `keydown` + `keypress` + `input` sequence |
-| `user-activation` | `challenges/10-user-activation.html` | feature gates: clipboard.writeText, fullscreen |
-| `honeypot` | `challenges/11-honeypot.html` | hidden field must stay empty |
-| `fingerprint` | `challenges/12-fingerprint.html` | UA-CH, languages, plugins, permissions consistency |
-| `focus-order` | `challenges/13-focus-order.html` | requires `pointerdown`-driven focus, not direct `.focus()` |
-| `wheel-scroll` | `challenges/14-wheel-scroll.html` | rejects scrollTop jumps without `wheel`/`scroll` events |
-| `drag-drop-datatransfer` | `challenges/15-drag-drop-datatransfer.html` | requires full HTML5 drag cycle with populated `DataTransfer` |
-| `contenteditable-selection` | `challenges/16-contenteditable-selection.html` | requires `selectionchange` + monotonic caret advance per keystroke |
-| `paste-clipboard` | `challenges/17-paste-clipboard.html` | demands real OS paste with `clipboardData` + `inputType=insertFromPaste` |
-| `native-select` | `challenges/18-native-select.html` | rejects `<option>` clicks / `.value=` assignment; needs trusted picker change |
-| `hover-dwell` | `challenges/19-hover-dwell.html` | reveal gated on ≥600ms hover with pointermove activity, latency after reveal |
-| `react-value-tracker` | `challenges/20-react-value-tracker.html` | input must mutate via native `value` setter so React's `_valueTracker` is stale |
-| `keyboard-modifiers` | `challenges/21-keyboard-modifiers.html` | Shift+a chord: modifier ordering, `shiftKey`, `code=KeyA`, `getModifierState` |
-| `touch-events` | `challenges/22-touch-events.html` | real `TouchEvent`+`Touch` (radius, force) — synthetic pointerType=touch fails |
-| `stack-trace-fingerprint` | `challenges/23-stack-trace-fingerprint.html` | inspects handler call stack for extension/eval/Runtime.evaluate frames |
-| `viewport-edge-clicks` | `challenges/24-viewport-edge-clicks.html` | rejects pointer events with clientX/Y outside viewport or (0,0) default |
-| `pointer-continuity` | `challenges/25-pointer-continuity.html` | two clicks far apart need bridging pointermoves with mid-span samples |
-| `mousemove-rate` | `challenges/26-mousemove-rate.html` | mousemove Δt distribution must match ~60–250Hz with jitter |
-| `scroll-momentum` | `challenges/27-scroll-momentum.html` | wheel ΔY trace must show peak + decaying momentum tail ≥100ms |
-| `intersection-visibility` | `challenges/28-intersection-visibility.html` | IntersectionObserver gradient + rAF scroll frames — no teleport |
+Manual baselines are tracked separately with `manualBaseline`. `unverified`
+means the manual expectation is a target, not a recorded contract.
 
-## What each `PASS` would require in `service_worker.js`
+## Recommended agent flow
 
-See `notes/bypass-ideas.md`.
+1. Navigate to dashboard:
+   `http://127.0.0.1:8765/`.
+2. Pick mode (`synthetic`, `trusted`, or `manual`) and clear local verdicts.
+3. For each manifest row:
+   - `chrome_navigate` to `http://127.0.0.1:8765/<file>`.
+   - `chrome_snapshot` before acting; prefer snapshot `uid` over raw selector.
+   - Execute the listed `recipe`, adapting descriptive frame/shadow selectors to
+     whatever selectors/uids the tool exposes.
+   - Read:
+     ```js
+     JSON.stringify({
+       v: window.__verdict,
+       r: window.__reason,
+       e: window.__events?.slice(-20)
+     })
+     ```
+4. Return to dashboard and compare actual verdicts with expected values.
+5. Copy JSON report from dashboard for PRs or regression notes.
+
+## Challenge categories
+
+- `trusted-input` — browser-trusted click/key events.
+- `pointer-humanization` — paths, coordinates, movement continuity/rate.
+- `keyboard` / `focus-keyboard` — typing fidelity, modifiers, Tab flows.
+- `activation-gates` — clipboard/fullscreen/user activation.
+- `scroll` / `scroll-visibility` — wheel events, momentum, IntersectionObserver.
+- `drag-drop` — HTML5 drag/drop + `DataTransfer`.
+- `clipboard` — OS/browser paste path.
+- `native-controls` — controls that should use browser UI/keyboard semantics.
+- `frameworks` / `editing` — React-style value tracking, contenteditable.
+- `dom-complexity` / `frames` — Shadow DOM and iframe targeting.
+- `files` — file attachment to `<input type=file>`.
+- `observability` — console/network capture tools.
+- `fingerprint` — environment and stack fingerprint probes.
+- `agent-safety` — hidden honeypots and safe target selection.
+
+## Current challenge inventory
+
+The dashboard renders this from `manifest.json`. In brief:
+
+1. trusted click
+2. trusted keyboard
+3. webdriver/runtime flags
+4. mouse entropy before click
+5. click timing
+6. click coordinate variation
+7. pointer event properties
+8. keyboard cadence
+9. beforeinput/input order
+10. user activation gates
+11. honeypot safety
+12. fingerprint consistency
+13. focus order
+14. wheel scroll
+15. drag/drop `DataTransfer`
+16. contenteditable selection
+17. paste clipboard
+18. native select
+19. hover dwell
+20. React value tracker
+21. keyboard modifiers
+22. touch events
+23. stack trace fingerprint
+24. viewport click coordinates
+25. pointer continuity
+26. mousemove rate
+27. scroll momentum
+28. intersection visibility
+29. Shadow DOM controls
+30. iframe targeting
+31. file upload
+32. keyboard Tab navigation
+33. network/console capture
+
+## Design notes
+
+- A failure is useful only when compared to expected mode. Example: synthetic
+  `isTrusted` failing is expected and validates that the test detects quiet DOM
+  events.
+- Some tests are capability-gated. Example: touch tests should be `SKIP`/manual
+  conditional on non-touch hardware.
+- Fingerprint tests should warn before blocking. Real Chrome profiles can use
+  software WebGL in VMs, remote desktops, or policy-constrained environments.
+- `notes/bypass-ideas.md` is historical guidance for older synthetic-only
+  versions. Prefer `manifest.json` for current expected outcomes.
