@@ -1166,6 +1166,29 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_tap",
+		label: "Chrome Tap (Touch)",
+		description:
+			"Dispatch a real browser-trusted touchstart/touchend tap via chrome.debugger (CDP Input.dispatchTouchEvent). Use for sites that gate on TouchEvent rather than MouseEvent (mobile-first PWAs, swipe carousels). Always uses the trusted CDP path — the yellow debugger banner appears.",
+		promptSnippet: "Tap (real touch) a Chrome element by snapshot uid, selector, or coordinate.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			x: Type.Optional(Type.Number()),
+			y: Type.Optional(Type.Number()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			const result = await bridge.send("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
+			return { content: [{ type: "text", text: `Tapped ${target} (touch)` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_scroll",
 		label: "Chrome Scroll",
 		description: "Scroll the page or a specific scrollable element by dispatching real wheel events with momentum-shaped deltas, then applying the scroll. Positive deltaY scrolls down. Pass uid/selector to scroll within a container, otherwise the document scrolls.",

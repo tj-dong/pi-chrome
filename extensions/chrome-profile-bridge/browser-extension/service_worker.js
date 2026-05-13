@@ -103,13 +103,31 @@ setInterval(() => {
   }
 }, 5000);
 
-function cdp(tabId, method, params) {
+function cdpRaw(tabId, method, params) {
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
   });
+}
+
+// Wraps cdpRaw with one auto-recover on detached/closed sessions:
+// chrome.debugger.attach can stay cached in attachedTabs even after Chrome killed
+// the session (tab nav, devtools opened/closed, etc). Recover by detaching the
+// stale entry and re-attaching, then retry the command once.
+async function cdp(tabId, method, params) {
+  try {
+    return await cdpRaw(tabId, method, params);
+  } catch (error) {
+    const msg = String(error?.message || error);
+    const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
+    if (!isStale) throw error;
+    attachedTabs.delete(tabId);
+    await chrome.debugger.attach({ tabId }, CDP_VERSION).catch(() => undefined);
+    attachedTabs.set(tabId, { detachAt: Date.now() + TRUSTED_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } });
+    return cdpRaw(tabId, method, params);
+  }
 }
 
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
@@ -349,18 +367,46 @@ async function trustedScroll(params) {
   const x = resolved.rect ? resolved.rect.left + Math.min(resolved.rect.width, 800) / 2 : resolved.x;
   const y = resolved.rect ? resolved.rect.top + Math.min(resolved.rect.height, 600) / 2 : resolved.y;
   const totalY = params.deltaY || 0, totalX = params.deltaX || 0;
-  const n = Math.max(3, Math.min(20, params.steps || Math.ceil(Math.abs(totalY) / 120)));
-  // momentum-shaped front-loaded weights
-  const w = []; for (let i = 1; i <= n; i++) w.push(1 / i);
+  // Cap per-step delta so IntersectionObserver / scroll-driven animations get gradient samples.
+  // Real wheel notches ~50-120px; we aim ~40-90.
+  const MAX_STEP = 80;
+  const minStepsByDelta = Math.ceil(Math.max(Math.abs(totalY), Math.abs(totalX)) / MAX_STEP);
+  const n = Math.max(6, Math.min(60, params.steps || Math.max(minStepsByDelta, 12)));
+  // Momentum shape: ramp-up, plateau, decay. Each weight peaked mid-sequence then tapers.
+  const w = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / Math.max(1, n - 1);
+    // bell-ish curve biased earlier so motion starts strong then decays (like a trackpad flick).
+    const base = Math.sin(Math.min(1, t * 1.4) * Math.PI);
+    const decay = Math.pow(1 - t * 0.6, 2);
+    w.push(0.2 + base * 0.8 * decay);
+  }
   const sumW = w.reduce((a, b) => a + b, 0);
   for (let i = 0; i < n; i++) {
     const dy = totalY * (w[i] / sumW), dx = totalX * (w[i] / sumW);
     await cdp(tab.id, "Input.dispatchMouseEvent", {
       type: "mouseWheel", x, y, deltaX: dx, deltaY: dy, pointerType: "mouse",
     });
-    await sleep(rng(14, 32));
+    // Sleep ~one frame+ so IntersectionObserver / rAF samples can run between events.
+    await sleep(rng(22, 52));
   }
   return { trusted: true, deltaX: totalX, deltaY: totalY, steps: n };
+}
+
+async function trustedTap(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  await attachDebugger(tab.id);
+  const resolved = (params.selector || params.uid || (typeof params.x === "number" && typeof params.y === "number"))
+    ? await resolveTargetInTab(tab.id, params)
+    : null;
+  if (!resolved || !resolved.found) throw new Error("trusted.tap: target not found");
+  const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+  const tp = { x: point.x, y: point.y, radiusX: 8, radiusY: 8, rotationAngle: 0, force: 0.5, id: 1 };
+  await cdp(tab.id, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [tp] });
+  await sleep(rng(40, 110));
+  await cdp(tab.id, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  return { trusted: true, x: point.x, y: point.y, tag: resolved.tag };
 }
 
 async function trustedDrag(params) {
@@ -537,6 +583,8 @@ async function dispatch(action, params) {
     case "page.scroll":
       if (await wantsTrusted(params)) return trustedScroll(params);
       return executeActionInTab(params, scrollPage, [params.selector ?? null, params.uid ?? null, params.deltaY ?? 0, params.deltaX ?? 0, params.steps ?? null]);
+    case "page.tap":
+      return trustedTap(params);
     case "trusted.mode":
       return setTrustedMode(params.mode);
     case "trusted.status":
