@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>37 autocomplete combobox</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: type <code>as</code>, use ArrowDown then Enter to choose <code>Aster Lamp</code> from ARIA combobox.</p>
+  <label>Product <input id="combo" role="combobox" aria-autocomplete="list" aria-controls="list" aria-expanded="false" autocomplete="off"></label>
+  <ul id="list" role="listbox" style="border:1px solid #555;max-width:260px;padding:6px;display:none"></ul>
+</main>
+<script>
+Challenge.init({ id: "autocomplete-combobox", instructions: "type 'as', ArrowDown, Enter to choose Aster Lamp" });
+const items = ["Aster Lamp", "Aspen Desk", "Cable Kit", "Desk Mat", "Red Mug"];
+let active = -1, opened = false, keyPath = [];
+combo.addEventListener("input", renderList);
+combo.addEventListener("keydown", e => {
+  keyPath.push(e.key);
+  const opts = [...list.querySelectorAll('[role="option"]')];
+  if (e.key === "ArrowDown") { e.preventDefault(); active = Math.min(active + 1, opts.length - 1); paintActive(opts); }
+  if (e.key === "Enter" && active >= 0 && opts[active]) { e.preventDefault(); combo.value = opts[active].textContent; close(); check(e); }
+});
+function renderList(){
+  const q = combo.value.toLowerCase();
+  const matches = items.filter(x => x.toLowerCase().includes(q));
+  list.innerHTML = matches.map((x,i)=>`<li role="option" id="opt-${i}" style="padding:4px;cursor:pointer">${x}</li>`).join("");
+  list.style.display = matches.length ? "block" : "none";
+  combo.setAttribute("aria-expanded", matches.length ? "true" : "false");
+  active = -1; opened ||= matches.length > 0;
+}
+function paintActive(opts){ opts.forEach((o,i)=>o.style.background = i===active ? "#2b4b6b" : ""); if(opts[active]) combo.setAttribute("aria-activedescendant", opts[active].id); }
+function close(){ list.style.display="none"; combo.setAttribute("aria-expanded","false"); }
+function check(e){
+  const bad=[];
+  if (!opened) bad.push("listbox never opened");
+  if (combo.value !== "Aster Lamp") bad.push(`selected ${combo.value}`);
+  if (!keyPath.includes("ArrowDown") || !keyPath.includes("Enter")) bad.push(`missing keyboard selection path: ${keyPath.join(",")}`);
+  if (!e.isTrusted) bad.push("Enter key isTrusted=false");
+  if (bad.length) Challenge.fail(...bad); else Challenge.pass("ARIA combobox selected via keyboard");
+}
+</script>
+</body>

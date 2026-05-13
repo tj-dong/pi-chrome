@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>38 SPA route change</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: navigate within SPA using links/buttons. URL must change via <code>history.pushState</code> without full reload. Then go Back to Settings, forward to Billing, and Save.</p>
+  <nav><a href="/settings" id="settings">Settings</a> <a href="/settings/billing" id="billing">Billing</a></nav>
+  <section id="view"></section>
+</main>
+<script>
+Challenge.init({ id: "spa-route-change", instructions: "Settings → Billing → Back → Billing → Save, no full reload" });
+let navs = 0, popstates = 0;
+window.__spaBootId = window.__spaBootId || Math.random().toString(36).slice(2);
+const bootId = window.__spaBootId;
+const navigationEntriesAtBoot = performance.getEntriesByType("navigation").length;
+function route(path){ history.pushState({}, "", path); navs++; render(); Challenge.log("route", { path, navs }); }
+settings.addEventListener("click", e => { e.preventDefault(); route("/settings"); });
+billing.addEventListener("click", e => { e.preventDefault(); route("/settings/billing"); });
+window.addEventListener("popstate", () => { popstates++; render(); Challenge.log("popstate", { path: location.pathname, popstates }); });
+function render(){
+  if (location.pathname.endsWith("/settings/billing")) view.innerHTML = `<h2>Billing</h2><button id="save">Save billing settings</button>`;
+  else if (location.pathname.endsWith("/settings")) view.innerHTML = `<h2>Settings</h2><p>Choose Billing.</p>`;
+  else view.innerHTML = `<h2>Home</h2>`;
+  const save = document.getElementById("save");
+  if (save) save.addEventListener("click", e => {
+    const bad=[];
+    if (!location.pathname.endsWith("/settings/billing")) bad.push(`wrong route ${location.pathname}`);
+    if (navs < 2) bad.push(`only ${navs} SPA route changes`);
+    if (popstates < 1) bad.push("browser Back/popstate was not observed");
+    if (window.__spaBootId !== bootId) bad.push("window sentinel changed; reload detected");
+    if (performance.getEntriesByType("navigation").length !== navigationEntriesAtBoot) bad.push("navigation entry count changed; reload suspected");
+    if (!e.isTrusted) bad.push("save click isTrusted=false");
+    if (bad.length) Challenge.fail(...bad); else Challenge.pass("SPA pushState flow completed without reload");
+  });
+}
+render();
+</script>
+</body>

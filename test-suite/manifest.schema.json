@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pi-chrome benchmark manifest",
-  "description": "Manifest for browser-control benchmark pages. Recipes are canonical intent, not guaranteed raw tool JSON: runners may need to adapt descriptive selectors (frame/shadow) and expand path placeholders such as $PWD before invoking tools.",
+  "description": "Manifest for browser-control benchmark pages. Recipes are canonical intent, not guaranteed raw tool JSON: runners may need to adapt descriptive selectors (frame/shadow) and expand path placeholders such as ${REPO_ROOT} before invoking tools.",
   "type": "array",
   "items": {
     "type": "object",
@@ -11,7 +11,10 @@
       "id": { "type": "string" },
       "file": { "type": "string" },
       "category": { "$ref": "#/$defs/category" },
+      "difficulty": { "enum": ["L1", "L2", "L3"] },
+      "tags": { "type": "array", "items": { "type": "string" } },
       "goal": { "type": "string" },
+      "gradeSource": { "enum": ["page", "harness", "both"], "default": "page" },
       "expected": {
         "type": "object",
         "description": "Expected verdict by execution mode. CONDITIONAL means prerequisites, browser policy, hardware, or missing tool primitives decide outcome.",
@@ -22,10 +25,7 @@
           "manual": { "$ref": "#/$defs/outcome" }
         }
       },
-      "manualBaseline": {
-        "description": "Whether human baseline has been explicitly verified in this repo/environment.",
-        "enum": ["unverified", "verified"]
-      },
+      "manualBaseline": { "description": "Whether human baseline has been explicitly verified in this repo/environment.", "enum": ["unverified", "verified"] },
       "manualBaselineVerifiedAt": { "type": "string", "format": "date-time" },
       "recipe": {
         "type": "array",
@@ -35,15 +35,28 @@
           "required": ["tool", "params"],
           "properties": {
             "tool": { "type": "string" },
-            "params": {
-              "type": "object",
-              "description": "Tool params. For upload recipes, paths are strings after runner expansion; $PWD means repository working directory."
-            }
+            "params": { "type": "object", "description": "Tool params. For upload recipes, paths are strings after runner expansion; ${REPO_ROOT} means repository root." }
           }
+        }
+      },
+      "requires": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "cdp": { "type": "boolean" },
+          "clipboard": { "type": "boolean" },
+          "touch": { "type": "boolean" },
+          "secureOrigin": { "type": "boolean" },
+          "fileSystem": { "type": "boolean" },
+          "dialogs": { "type": "boolean" },
+          "downloads": { "type": "boolean" },
+          "popups": { "type": "boolean" }
         }
       },
       "prerequisites": { "type": "array", "items": { "type": "string" } },
       "notes": { "type": "array", "items": { "type": "string" } },
+      "thresholds": { "type": "object", "additionalProperties": true },
+      "timeoutMs": { "type": "number" },
       "verdictDelayMs": { "type": "number" },
       "flakeRisk": { "enum": ["low", "medium", "high"] }
     }
@@ -52,27 +65,7 @@
     "outcome": { "enum": ["PASS", "FAIL", "SKIP", "WARN", "CONDITIONAL"] },
     "category": {
       "enum": [
-        "activation-gates",
-        "agent-safety",
-        "clipboard",
-        "dom-complexity",
-        "drag-drop",
-        "editing",
-        "files",
-        "fingerprint",
-        "focus-keyboard",
-        "frames",
-        "frameworks",
-        "hover",
-        "keyboard",
-        "native-controls",
-        "observability",
-        "pointer-humanization",
-        "scroll",
-        "scroll-visibility",
-        "timing",
-        "touch",
-        "trusted-input"
+        "activation-gates", "agent-safety", "aria-snapshot", "canvas-svg", "clipboard", "contextmenu", "dialogs", "dom-complexity", "downloads", "drag-drop", "editing", "files", "fingerprint", "focus-keyboard", "forms", "frames", "frameworks", "hover", "keyboard", "lazy-loading", "native-controls", "observability", "pointer-humanization", "popups", "scroll", "scroll-visibility", "spa-routing", "task-completion", "timing", "touch", "trusted-input"
       ]
     }
   }

@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>35 target blank popup</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: click <code>target=_blank</code> link, detect new tab, switch to it, and verify child page reports PASS.</p>
+  <a id="open" target="_blank" rel="opener" href="35-target-blank-popup.html?child=1" style="font-size:18px">Open child tab</a>
+  <p id="msg"></p>
+</main>
+<script>
+Challenge.init({ id: "target-blank-popup", instructions: "open child tab and inspect it" });
+const qs = new URLSearchParams(location.search);
+if (qs.get("child") === "1") {
+  document.getElementById("msg").textContent = "Child tab opened.";
+  Challenge.pass("child tab loaded on same origin");
+  try { localStorage.setItem("pi-chrome-suite:target-blank-popup", JSON.stringify({ id:"target-blank-popup", verdict:"PASS", reason:["✓ child tab loaded"], ts: Date.now() })); } catch {}
+} else {
+  document.getElementById("msg").textContent = "Parent page. Link should open new tab.";
+  function maybePassFromStorage(raw) {
+    if (!raw) return;
+    try {
+      const v = JSON.parse(raw);
+      if (v.verdict === "PASS") Challenge.pass("child reported PASS via storage event/localStorage");
+    } catch {}
+  }
+  window.addEventListener("storage", e => {
+    if (e.key === "pi-chrome-suite:target-blank-popup") maybePassFromStorage(e.newValue);
+  });
+  maybePassFromStorage(localStorage.getItem("pi-chrome-suite:target-blank-popup"));
+  document.getElementById("open").addEventListener("click", e => Challenge.log("popup-click", { trusted: e.isTrusted }));
+}
+</script>
+</body>

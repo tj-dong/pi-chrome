@@ -1,0 +1,9 @@
+[
+  {
+    "id": "mini-shop-red-second-cheapest",
+    "difficulty": "L2",
+    "intent": "Add the second-cheapest red product to cart, checkout, and leave the generated order id visible.",
+    "gradeSource": "harness",
+    "grader": "MiniShopGrader.grade(task, state, products, run)"
+  }
+]

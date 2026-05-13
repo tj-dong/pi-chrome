@@ -1,13 +1,14 @@
 # pi-chrome browser-control benchmark
 
-Static benchmark pages for evaluating tools that let agents control Chrome. The
-suite covers two related questions:
+Static benchmark pages for evaluating tools that let agents control Chrome. The suite has two layers:
 
-1. **Can the agent complete normal browser work?** Forms, scroll containers,
-   contenteditable, files, frames, Shadow DOM, network/console inspection.
-2. **Does the interaction look like a human/browser action when sites care?**
-   `isTrusted`, user activation, pointer paths, key cadence, native controls,
-   drag/drop, touch, paste, and scroll momentum.
+1. **Unit challenges** (`manifest.json`) — MiniWoB-style capability probes for
+   forms, scroll containers, contenteditable, files, frames, Shadow DOM,
+   network/console inspection, `isTrusted`, user activation, pointer paths, key
+   cadence, native controls, drag/drop, touch, paste, and scroll momentum.
+2. **Long-horizon hermetic tasks** (`task-manifest.json`) — WebArena /
+   BrowserGym-inspired multi-step tasks with fresh run IDs and deterministic
+   programmatic graders.
 
 ## Run
 
@@ -24,11 +25,17 @@ Each challenge page exposes:
 - `window.__reason` — array of reasons
 - `window.__events` — raw event log for forensics
 
-`manifest.json` is the source of truth for benchmark metadata: category, goal,
-expected result per mode, prerequisites, flake risk, manual baseline status, and
-canonical tool recipe. `manifest.schema.json` documents the manifest shape.
-Recipes express tool intent; runners may need to adapt descriptive selectors
-(e.g. shadow/iframe notation) and expand path placeholders like `$PWD`.
+`manifest.json` is the source of truth for unit-challenge metadata: category,
+goal, expected result per mode, prerequisites, flake risk, manual baseline
+status, and canonical tool recipe. `manifest.schema.json` documents the manifest
+shape. Recipes express tool intent; runners may need to adapt descriptive
+selectors (e.g. shadow/iframe notation) and expand path placeholders like `$PWD`.
+
+`task-manifest.json` is the source of truth for long-horizon tasks: BrowserGym-style
+`taskId`, seed, viewport, goal object, difficulty tier, max steps, declared
+action subsets, reset/setup URL, validate hook, optional cheat recipe, and
+programmatic grader expression. `task-manifest.schema.json` documents this shape.
+`browsergym-action-space.json` records BrowserGym-compatible action subsets.
 
 ## Modes / expected outcomes
 
@@ -49,7 +56,7 @@ Expected values in `manifest.json`:
 Manual baselines are tracked separately with `manualBaseline`. `unverified`
 means the manual expectation is a target, not a recorded contract.
 
-## Recommended agent flow
+## Recommended unit-challenge agent flow
 
 1. Navigate to dashboard:
    `http://127.0.0.1:8765/`.
@@ -69,6 +76,29 @@ means the manual expectation is a target, not a recorded contract.
      ```
 4. Return to dashboard and compare actual verdicts with expected values.
 5. Copy JSON report from dashboard for PRs or regression notes.
+
+## Recommended long-horizon task flow
+
+1. Load `task-manifest.json`.
+2. Replace `$RUN_ID` in `startUrl` with a fresh value.
+3. Navigate to the start URL and read the visible task instruction.
+4. Solve using normal browser tools only; avoid direct state mutation unless the
+   benchmark mode explicitly allows evaluate-based actions.
+5. Click **Grade now** or evaluate the task grader expression:
+   ```js
+   JSON.stringify({ v: window.__taskVerdict, r: window.__taskReason })
+   ```
+6. Record action count, observations used, tools used, verdict, and reason.
+
+## Design principles copied from browser-agent benchmarks
+
+- Prefer hermetic sites and deterministic graders over live sites and LLM judges.
+- Report action API and observation format; these strongly affect scores.
+- Use difficulty tiers: L1 atomic, L2 compositional, L3 cross-page/context-rich.
+- Include tedious cross-page memory and exact-value transfer tasks; short unit
+  probes hide these failures.
+- Keep synthetic-event-gated tests because extension bridges face failures that
+  CDP/Playwright-style benchmarks usually do not measure.
 
 ## Challenge categories
 
@@ -136,3 +166,7 @@ The dashboard renders this from `manifest.json`. In brief:
   software WebGL in VMs, remote desktops, or policy-constrained environments.
 - `notes/bypass-ideas.md` is historical guidance for older synthetic-only
   versions. Prefer `manifest.json` for current expected outcomes.
+- `notes/browsergym-compat.md` defines the reset/step/validate/observation/BID
+  contract for external BrowserGym-style agents.
+- `notes/runner-spec.md`, `notes/scoring.md`, and `notes/profiles.md` define
+  runner output, scoring, retry policy, and environment metadata.

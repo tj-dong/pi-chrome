@@ -1,0 +1,416 @@
+[
+  {
+    "id": "choredesk-l1-ticket-priority",
+    "site": "choredesk",
+    "startUrl": "scenarios/choredesk/index.html?task=choredesk-l1-ticket-priority&run=$RUN_ID&seed=$SEED",
+    "difficulty": "L1",
+    "category": "enterprise-crud",
+    "intent": "Set ticket T-104 priority to High and status to In Progress, then save it.",
+    "expectedActions": {
+      "min": 3,
+      "max": 6
+    },
+    "requires": [
+      "snapshot",
+      "click",
+      "select/change",
+      "form editing"
+    ],
+    "grader": {
+      "type": "inPageProgrammatic",
+      "expression": "JSON.stringify(window.__taskValidation || {v:window.__taskVerdict,r:window.__taskReason})",
+      "passValue": "PASS"
+    },
+    "browserGymLike": {
+      "observation": [
+        "dom",
+        "accessibility_tree",
+        "screenshot_optional"
+      ],
+      "actionSpace": [
+        "click",
+        "type",
+        "select",
+        "evaluate_optional"
+      ],
+      "reset": "navigate startUrl with fresh $RUN_ID or click Reset run",
+      "stepReturn": "obs,reward,terminated,truncated,info"
+    },
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "slowMoMs": 1000,
+    "timeoutMs": 5000,
+    "locale": null,
+    "timezoneId": null,
+    "humanBaseline": null,
+    "actionSubsets": [
+      "bid",
+      "nav",
+      "tab",
+      "infeas",
+      "chat"
+    ],
+    "rewardShape": "binary",
+    "taskId": "choredesk.L1.ticket-priority",
+    "seed": 101,
+    "maxSteps": 8,
+    "allowedActions": [
+      "click",
+      "fill",
+      "select_option",
+      "goto",
+      "report_infeasible",
+      "send_msg_to_user"
+    ],
+    "setupUrl": "scenarios/choredesk/index.html?task=choredesk-l1-ticket-priority&run=$RUN_ID&seed=$SEED",
+    "validateScript": "scenarios/choredesk/index.html#window.__choredesk.validate()",
+    "cheatScript": "scenarios/choredesk/cheats.js#choredesk-l1-ticket-priority",
+    "tags": [
+      "form-fill",
+      "ticket",
+      "select"
+    ],
+    "rubric": [
+      {
+        "id": "priorityHigh",
+        "weight": 0.33,
+        "description": "T-104 priority is High"
+      },
+      {
+        "id": "statusInProgress",
+        "weight": 0.33,
+        "description": "T-104 status is In Progress"
+      },
+      {
+        "id": "saved",
+        "weight": 0.34,
+        "description": "T-104 was saved"
+      }
+    ],
+    "goal": "Set ticket T-104 priority to High and status to In Progress, then save it.",
+    "goalObject": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Set ticket T-104 priority to High and status to In Progress, then save it."
+          }
+        ]
+      }
+    ],
+    "gradeSource": "page"
+  },
+  {
+    "id": "choredesk-l2-refund-message",
+    "site": "choredesk",
+    "startUrl": "scenarios/choredesk/index.html?task=choredesk-l2-refund-message&run=$RUN_ID&seed=$SEED",
+    "difficulty": "L2",
+    "category": "cross-page-memory",
+    "intent": "Resolve a customer billing task by looking up customer email and order total on separate pages, then composing a message with exact required fields.",
+    "expectedActions": {
+      "min": 8,
+      "max": 14
+    },
+    "requires": [
+      "multi-page navigation",
+      "table lookup",
+      "working memory",
+      "form composition"
+    ],
+    "grader": {
+      "type": "inPageProgrammatic",
+      "expression": "JSON.stringify(window.__taskValidation || {v:window.__taskVerdict,r:window.__taskReason})",
+      "passValue": "PASS"
+    },
+    "browserGymLike": {
+      "observation": [
+        "dom",
+        "accessibility_tree",
+        "screenshot_optional"
+      ],
+      "actionSpace": [
+        "click",
+        "type",
+        "select",
+        "evaluate_optional"
+      ],
+      "reset": "navigate startUrl with fresh $RUN_ID or click Reset run",
+      "stepReturn": "obs,reward,terminated,truncated,info"
+    },
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "slowMoMs": 1000,
+    "timeoutMs": 5000,
+    "locale": null,
+    "timezoneId": null,
+    "humanBaseline": null,
+    "actionSubsets": [
+      "bid",
+      "nav",
+      "tab",
+      "infeas",
+      "chat"
+    ],
+    "rewardShape": "binary",
+    "taskId": "choredesk.L2.refund-message",
+    "seed": 202,
+    "maxSteps": 16,
+    "allowedActions": [
+      "click",
+      "fill",
+      "select_option",
+      "goto",
+      "report_infeasible",
+      "send_msg_to_user"
+    ],
+    "setupUrl": "scenarios/choredesk/index.html?task=choredesk-l2-refund-message&run=$RUN_ID&seed=$SEED",
+    "validateScript": "scenarios/choredesk/index.html#window.__choredesk.validate()",
+    "cheatScript": "scenarios/choredesk/cheats.js#choredesk-l2-refund-message",
+    "tags": [
+      "lookup",
+      "cross-page-memory",
+      "message-compose"
+    ],
+    "rubric": [
+      {
+        "id": "messageSubject",
+        "weight": 0.34,
+        "description": "Billing message subject matches"
+      },
+      {
+        "id": "email",
+        "weight": 0.33,
+        "description": "Body includes Noah email"
+      },
+      {
+        "id": "total",
+        "weight": 0.33,
+        "description": "Body includes exact order total"
+      }
+    ],
+    "goal": "Resolve a customer billing task by looking up customer email and order total on separate pages, then composing a message with exact required fields.",
+    "goalObject": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Resolve a customer billing task by looking up customer email and order total on separate pages, then composing a message with exact required fields."
+          }
+        ]
+      }
+    ],
+    "gradeSource": "page"
+  },
+  {
+    "id": "choredesk-l3-restock-ticket",
+    "site": "choredesk",
+    "startUrl": "scenarios/choredesk/index.html?task=choredesk-l3-restock-ticket&run=$RUN_ID&seed=$SEED",
+    "difficulty": "L3",
+    "category": "cross-page-state-update",
+    "intent": "Use ticket text to identify an item, map item to SKU in Catalog, update Inventory reorder quantity, and add exact internal note back on the ticket.",
+    "expectedActions": {
+      "min": 12,
+      "max": 20
+    },
+    "requires": [
+      "multi-page navigation",
+      "entity resolution",
+      "state mutation",
+      "exact text note",
+      "audit-save behavior"
+    ],
+    "grader": {
+      "type": "inPageProgrammatic",
+      "expression": "JSON.stringify(window.__taskValidation || {v:window.__taskVerdict,r:window.__taskReason})",
+      "passValue": "PASS"
+    },
+    "browserGymLike": {
+      "observation": [
+        "dom",
+        "accessibility_tree",
+        "screenshot_optional"
+      ],
+      "actionSpace": [
+        "click",
+        "type",
+        "select",
+        "evaluate_optional"
+      ],
+      "reset": "navigate startUrl with fresh $RUN_ID or click Reset run",
+      "stepReturn": "obs,reward,terminated,truncated,info"
+    },
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "slowMoMs": 1000,
+    "timeoutMs": 5000,
+    "locale": null,
+    "timezoneId": null,
+    "humanBaseline": null,
+    "actionSubsets": [
+      "bid",
+      "nav",
+      "tab",
+      "infeas",
+      "chat"
+    ],
+    "rewardShape": "binary",
+    "taskId": "choredesk.L3.restock-ticket",
+    "seed": 303,
+    "maxSteps": 24,
+    "allowedActions": [
+      "click",
+      "fill",
+      "select_option",
+      "goto",
+      "report_infeasible",
+      "send_msg_to_user"
+    ],
+    "setupUrl": "scenarios/choredesk/index.html?task=choredesk-l3-restock-ticket&run=$RUN_ID&seed=$SEED",
+    "validateScript": "scenarios/choredesk/index.html#window.__choredesk.validate()",
+    "cheatScript": "scenarios/choredesk/cheats.js#choredesk-l3-restock-ticket",
+    "tags": [
+      "entity-resolution",
+      "cross-page-state-update",
+      "exact-note"
+    ],
+    "rubric": [
+      {
+        "id": "inventory",
+        "weight": 0.4,
+        "description": "AST-LAMP reorder quantity is 12 and saved"
+      },
+      {
+        "id": "ticketNote",
+        "weight": 0.4,
+        "description": "T-205 note contains exact phrase"
+      },
+      {
+        "id": "audit",
+        "weight": 0.2,
+        "description": "Both save audit entries exist"
+      }
+    ],
+    "goal": "Use ticket text to identify an item, map item to SKU in Catalog, update Inventory reorder quantity, and add exact internal note back on the ticket.",
+    "goalObject": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Use ticket text to identify an item, map item to SKU in Catalog, update Inventory reorder quantity, and add exact internal note back on the ticket."
+          }
+        ]
+      }
+    ],
+    "gradeSource": "page"
+  },
+  {
+    "id": "mini-shop-red-second-cheapest",
+    "site": "mini-shop",
+    "startUrl": "fixtures/sites/mini-shop/index.html?task=mini-shop-red-second-cheapest&run=$RUN_ID&seed=$SEED",
+    "difficulty": "L2",
+    "category": "task-completion",
+    "intent": "Add the second-cheapest red product to cart, checkout, and leave the generated order id visible.",
+    "expectedActions": {
+      "min": 5,
+      "max": 9
+    },
+    "requires": [
+      "filter/sort reasoning",
+      "cart state",
+      "checkout flow"
+    ],
+    "grader": {
+      "type": "inPageProgrammatic",
+      "expression": "JSON.stringify(window.__taskValidation || {v:window.__taskVerdict,r:window.__taskReason})",
+      "passValue": "PASS"
+    },
+    "browserGymLike": {
+      "observation": [
+        "dom",
+        "accessibility_tree",
+        "screenshot_optional"
+      ],
+      "actionSpace": [
+        "click",
+        "read_table",
+        "evaluate_optional"
+      ],
+      "reset": "navigate startUrl with fresh $RUN_ID",
+      "stepReturn": "obs,reward,terminated,truncated,info"
+    },
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "slowMoMs": 1000,
+    "timeoutMs": 5000,
+    "locale": null,
+    "timezoneId": null,
+    "humanBaseline": null,
+    "actionSubsets": [
+      "bid",
+      "nav",
+      "tab",
+      "infeas",
+      "chat"
+    ],
+    "rewardShape": "binary",
+    "taskId": "mini-shop.L2.red-second-cheapest",
+    "seed": 404,
+    "maxSteps": 12,
+    "allowedActions": [
+      "click",
+      "goto",
+      "report_infeasible",
+      "send_msg_to_user"
+    ],
+    "setupUrl": "fixtures/sites/mini-shop/index.html?task=mini-shop-red-second-cheapest&run=$RUN_ID&seed=$SEED",
+    "validateScript": "fixtures/sites/mini-shop/grader.js#MiniShopGrader.validate",
+    "cheatScript": "fixtures/sites/mini-shop/cheats.js#mini-shop-red-second-cheapest",
+    "tags": [
+      "shopping",
+      "sort",
+      "cart",
+      "checkout"
+    ],
+    "rubric": [
+      {
+        "id": "addedTarget",
+        "weight": 0.4,
+        "description": "Cart includes second-cheapest red product"
+      },
+      {
+        "id": "noWrongItems",
+        "weight": 0.3,
+        "description": "Cart has no wrong products"
+      },
+      {
+        "id": "checkedOut",
+        "weight": 0.3,
+        "description": "Checkout produced order id"
+      }
+    ],
+    "goal": "Add the second-cheapest red product to cart, checkout, and leave the generated order id visible.",
+    "goalObject": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Add the second-cheapest red product to cart, checkout, and leave the generated order id visible."
+          }
+        ]
+      }
+    ],
+    "gradeSource": "both"
+  }
+]

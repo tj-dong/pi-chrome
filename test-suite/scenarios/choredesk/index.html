@@ -1,0 +1,239 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ChoreDesk hermetic task site</title>
+<link rel="stylesheet" href="../../_style.css">
+<style>
+  main { max-width: 1180px; }
+  .top { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .tabs { display:flex; gap:8px; margin:16px 0; flex-wrap:wrap; }
+  .tab { border:1px solid #444; border-radius:999px; padding:6px 10px; color:#eee; text-decoration:none; background:#222; }
+  .tab[aria-current="page"] { background:#2b4b6b; }
+  .card { border:1px solid #333; border-radius:10px; background:#202020; padding:14px; }
+  table { font-size:13px; }
+  td input, td select { width: 100%; box-sizing:border-box; }
+  textarea { width:100%; min-height:110px; background:#111; color:#eee; border:1px solid #555; border-radius:6px; padding:8px; }
+  .muted { color:#aaa; font-size:12px; }
+  .taskbar { border:1px solid #4b3b16; background:#221b0d; border-radius:10px; padding:12px; margin:12px 0; }
+  .verdict { display:inline-block; border-radius:999px; padding:2px 8px; font-weight:700; background:#444; }
+  .verdict.PASS { background:#1f7a1f; }
+  .verdict.FAIL { background:#a11; }
+  .verdict.PENDING { background:#444; }
+</style>
+<body>
+<main>
+  <div class="top">
+    <h1 style="margin-right:auto">ChoreDesk</h1>
+    <button id="reset" data-task-role="reset-button">Reset run</button>
+    <button id="grade" data-task-role="grade-button">Grade now</button>
+    <button id="cheat" data-task-role="cheat-button">Run cheat</button>
+  </div>
+  <div class="taskbar">
+    <div><b id="taskId"></b> <span id="difficulty"></span> <span id="verdict" class="verdict PENDING">PENDING</span> <span id="reward" class="muted"></span></div>
+    <p id="instruction"></p>
+    <pre id="reason" class="muted"></pre>
+  </div>
+  <nav class="tabs" aria-label="ChoreDesk sections"></nav>
+  <section id="view"></section>
+</main>
+<script src="cheats.js"></script>
+<script>
+(function () {
+const params = new URLSearchParams(location.search);
+if (!params.get("run")) {
+  params.set("run", crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+  history.replaceState(null, "", `?${params}`);
+}
+const task = params.get("task") || "choredesk-l1-ticket-priority";
+const run = params.get("run");
+const seed = Number(params.get("seed") || 0);
+const nonce = params.get("nonce") || (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
+if (!params.get("nonce")) { params.set("nonce", nonce); history.replaceState(null, "", `?${params}`); }
+const storeKey = `pi-chrome-task-state:${task}:${run}:${seed}:${nonce}`;
+const verdictKey = `pi-chrome-task:${task}:${run}`;
+const views = ["tickets", "customers", "orders", "catalog", "inventory", "messages", "audit"];
+let view = params.get("view") || "tickets";
+let bidCounter = 0;
+
+const TASKS = {
+  "choredesk-l1-ticket-priority": {
+    difficulty: "L1 atomic",
+    instruction: "Set ticket T-104 priority to High and status to In Progress. Save the ticket.",
+    rubric(s) {
+      const t = s.tickets.find(x => x.id === "T-104");
+      return [
+        { id:"priorityHigh", weight:.33, pass:t?.priority === "High", description:"T-104 priority is High", reason:`T-104 priority=${t?.priority}` },
+        { id:"statusInProgress", weight:.33, pass:t?.status === "In Progress", description:"T-104 status is In Progress", reason:`T-104 status=${t?.status}` },
+        { id:"saved", weight:.34, pass:s.audit.some(a => a.kind === "ticket-save" && a.id === "T-104" && a.via === "ui-event"), description:"T-104 saved through UI", reason:"no UI save audit for T-104" }
+      ];
+    }
+  },
+  "choredesk-l2-refund-message": {
+    difficulty: "L2 compositional",
+    instruction: "A customer named Noah Kim reports a duplicate charge. Find Noah's email and order ORD-778 total, then send Billing a message with subject 'Refund review ORD-778'. Body must include Noah's email and the exact order total.",
+    rubric(s) {
+      const msg = s.messages.find(m => m.to === "Billing" && m.subject.trim() === "Refund review ORD-778");
+      return [
+        { id:"visitedCustomers", weight:.15, pass:!!s.viewsVisited.customers, description:"Opened Customers view", reason:"never opened Customers view" },
+        { id:"visitedOrders", weight:.15, pass:!!s.viewsVisited.orders, description:"Opened Orders view", reason:"never opened Orders view" },
+        { id:"subject", weight:.20, pass:!!msg, description:"Billing message with exact subject exists", reason:"missing Billing message with exact subject" },
+        { id:"email", weight:.25, pass:!!msg && /\bnoah\.kim@example\.com\b/i.test(msg.body), description:"Body includes Noah email", reason:"message body missing Noah email" },
+        { id:"total", weight:.25, pass:!!msg && /(?<![\d.])\$?84\.20\b/.test(msg.body), description:"Body includes exact ORD-778 total", reason:"message body missing exact ORD-778 total 84.20" }
+      ];
+    }
+  },
+  "choredesk-l3-restock-ticket": {
+    difficulty: "L3 cross-page tedious",
+    instruction: "Ticket T-205 says Aster Lamp is delayed. Find the Aster Lamp SKU in Catalog, set its Inventory reorder quantity to 12, then add an internal note to T-205 saying 'reordered 12 AST-LAMP'.",
+    rubric(s) {
+      const inv = s.inventory.find(x => x.sku === "AST-LAMP");
+      const t = s.tickets.find(x => x.id === "T-205");
+      return [
+        { id:"visitedCatalog", weight:.15, pass:!!s.viewsVisited.catalog, description:"Opened Catalog view", reason:"never opened Catalog view" },
+        { id:"visitedInventory", weight:.15, pass:!!s.viewsVisited.inventory, description:"Opened Inventory view", reason:"never opened Inventory view" },
+        { id:"inventory", weight:.25, pass:Number(inv?.reorderQty) === 12 && s.audit.some(a => a.kind === "inventory-save" && a.id === "AST-LAMP" && a.via === "ui-event"), description:"AST-LAMP reorderQty=12 saved through UI", reason:`AST-LAMP reorderQty=${inv?.reorderQty}; missing UI save audit` },
+        { id:"ticketNote", weight:.25, pass:!!t && t.note.includes("reordered 12 AST-LAMP"), description:"T-205 note contains exact phrase", reason:"T-205 internal note missing exact phrase" },
+        { id:"ticketSaved", weight:.20, pass:s.audit.some(a => a.kind === "ticket-save" && a.id === "T-205" && a.via === "ui-event"), description:"T-205 saved through UI", reason:"no UI save audit for T-205" }
+      ];
+    }
+  }
+};
+const SEED = {
+  tickets: [
+    { id:"T-101", customer:"Rosa Patel", subject:"Where is my desk mat?", priority:"Normal", status:"Open", note:"" },
+    { id:"T-104", customer:"Iris Zhao", subject:"Invoice address typo", priority:"Low", status:"Open", note:"" },
+    { id:"T-205", customer:"Mateo Silva", subject:"Aster Lamp delayed", priority:"Normal", status:"Open", note:"" },
+    { id:"T-309", customer:"Noah Kim", subject:"Duplicate charge", priority:"Normal", status:"Open", note:"" }
+  ],
+  customers: [
+    { name:"Noah Kim", email:"noah.kim@example.com", tier:"Gold" },
+    { name:"Rosa Patel", email:"rosa.patel@example.com", tier:"Silver" },
+    { name:"Iris Zhao", email:"iris.zhao@example.com", tier:"Bronze" },
+    { name:"Mateo Silva", email:"mateo.silva@example.com", tier:"Gold" }
+  ],
+  orders: [
+    { id:"ORD-778", customer:"Noah Kim", item:"Cable Kit", total:"$84.20", status:"Paid" },
+    { id:"ORD-812", customer:"Rosa Patel", item:"Desk Mat", total:"$28.00", status:"Shipped" },
+    { id:"ORD-919", customer:"Mateo Silva", item:"Aster Lamp", total:"$134.50", status:"Delayed" }
+  ],
+  catalog: [
+    { item:"Aster Lamp", sku:"AST-LAMP", vendor:"Northwind Lighting" },
+    { item:"Desk Mat", sku:"DSK-MAT", vendor:"Woven Works" },
+    { item:"Cable Kit", sku:"CBL-KIT", vendor:"Copper Lane" }
+  ],
+  inventory: [
+    { sku:"AST-LAMP", onHand:0, reorderQty:0 },
+    { sku:"DSK-MAT", onHand:42, reorderQty:0 },
+    { sku:"CBL-KIT", onHand:6, reorderQty:0 }
+  ],
+  messages: [],
+  audit: [],
+  viewsVisited: {},
+  actionCount: 0,
+  startedAt: Date.now()
+};
+let state = loadState();
+function clone(x){ return JSON.parse(JSON.stringify(x)); }
+function loadState(){ const raw = localStorage.getItem(storeKey); return raw ? JSON.parse(raw) : clone(SEED); }
+function saveState(){ localStorage.setItem(storeKey, JSON.stringify(state)); }
+function countAction(kind){ state.actionCount = (state.actionCount || 0) + 1; state.lastAction = kind; }
+function audit(entry){ state.audit.push({ ts:new Date().toISOString(), via:"ui-event", trusted:!!entry.trusted, ...entry }); saveState(); grade(false); }
+function rubric(){ return (TASKS[task] || TASKS["choredesk-l1-ticket-priority"]).rubric(state); }
+function validate(){
+  const items = rubric();
+  const total = items.reduce((a,x)=>a+x.weight,0) || 1;
+  const got = items.filter(x=>x.pass).reduce((a,x)=>a+x.weight,0);
+  const reward = Math.round((got / total) * 1000) / 1000;
+  const done = reward === 1;
+  const bad = items.filter(x=>!x.pass).map(x=>x.reason || `${x.id} failed`);
+  return { reward, done, message: done ? "all deterministic checks passed" : bad.join("; "), info: { task, seed, run, actionCount:state.actionCount||0, elapsedMs:Date.now()-(state.startedAt||Date.now()), viewsVisited:state.viewsVisited, rubric:items, state } };
+}
+function observation(){
+  return { goal:TASKS[task]?.instruction, url:location.href, activeView:view, title:document.title, reward:window.__taskReward, actionCount:state.actionCount||0, viewsVisited:state.viewsVisited, focusedElementBid:document.activeElement?.getAttribute("bid") || null };
+}
+function setVerdict(verdict, reason, validation = validate()){
+  window.__taskVerdict = verdict;
+  window.__taskReason = reason;
+  window.__taskValidation = validation;
+  window.__taskReward = validation.reward;
+  window.__taskTerminated = validation.done;
+  window.__taskTruncated = (state.actionCount || 0) >= Number(params.get("maxSteps") || 9999);
+  window.__taskInfo = validation.info;
+  localStorage.setItem(verdictKey, JSON.stringify({ id: task, run, seed, verdict, reason, validation, state, ts: Date.now() }));
+  document.getElementById("verdict").textContent = verdict;
+  document.getElementById("verdict").className = "verdict " + verdict;
+  document.getElementById("reward").textContent = `reward=${validation.reward} actions=${state.actionCount || 0}`;
+  document.getElementById("reason").textContent = reason.join("\n");
+}
+function grade(showPass=true){ const v = validate(); if (!v.done) setVerdict(showPass ? "FAIL" : "PENDING", v.info.rubric.filter(x=>!x.pass).map(x=>`${x.id}: ${x.reason}`), v); else setVerdict("PASS", [v.message], v); return v; }
+function route(v){ view = v; state.viewsVisited[v] = (state.viewsVisited[v] || 0) + 1; countAction("route:" + v); saveState(); history.replaceState(null, "", `?task=${encodeURIComponent(task)}&run=${encodeURIComponent(run)}&seed=${seed}&nonce=${nonce}&view=${encodeURIComponent(view)}`); render(); }
+function renderShell(){
+  const spec = TASKS[task] || TASKS["choredesk-l1-ticket-priority"];
+  document.getElementById("taskId").textContent = task;
+  document.getElementById("difficulty").textContent = spec.difficulty;
+  document.getElementById("instruction").textContent = spec.instruction;
+  const nav = document.querySelector(".tabs"); nav.innerHTML = "";
+  for (const v of views) { const a = document.createElement("a"); a.href="#"; a.className="tab"; a.textContent=v[0].toUpperCase()+v.slice(1); a.dataset.view=v; a.setAttribute("data-task-role", "nav-tab"); if(v===view)a.setAttribute("aria-current","page"); a.addEventListener("click", e=>{e.preventDefault(); route(v);}); nav.appendChild(a); }
+}
+function render(){
+  renderShell(); bidCounter = 0;
+  const root = document.getElementById("view"); root.innerHTML = "";
+  if (view === "tickets") root.appendChild(tableEditor("tickets", state.tickets, ["id","customer","subject","priority","status","note"], saveTicket));
+  if (view === "customers") root.appendChild(readTable(state.customers, ["name","email","tier"]));
+  if (view === "orders") root.appendChild(readTable(state.orders, ["id","customer","item","total","status"]));
+  if (view === "catalog") root.appendChild(readTable(state.catalog, ["item","sku","vendor"]));
+  if (view === "inventory") root.appendChild(tableEditor("inventory", state.inventory, ["sku","onHand","reorderQty"], saveInventory));
+  if (view === "messages") root.appendChild(messageComposer());
+  if (view === "audit") root.appendChild(readTable(state.audit.map((entry,i)=>({ n:i+1, entry: JSON.stringify(entry) })), ["n","entry"]));
+  assignBids(); grade(false);
+}
+function readTable(rows, cols){
+  const wrap = document.createElement("div"); wrap.className="card";
+  wrap.innerHTML = `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join("")}</tr></thead><tbody></tbody></table>`;
+  const tb = wrap.querySelector("tbody");
+  for (const r of rows) { const tr = document.createElement("tr"); tr.innerHTML = cols.map(c => `<td>${escapeHtml(r[c] ?? "")}</td>`).join(""); tb.appendChild(tr); }
+  return wrap;
+}
+function tableEditor(kind, rows, cols, onSave){
+  const wrap = document.createElement("div"); wrap.className="card";
+  wrap.innerHTML = `<table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join("")}<th>save</th></tr></thead><tbody></tbody></table>`;
+  const tb = wrap.querySelector("tbody");
+  rows.forEach((r) => {
+    const key = r.id || r.sku; const tr = document.createElement("tr"); tr.dataset.itemId = key; if (r.id) tr.dataset.ticketId = r.id; if (r.sku) tr.dataset.sku = r.sku;
+    for (const c of cols) {
+      const td = document.createElement("td");
+      const stableAttrs = `${r.id ? `data-ticket-id="${r.id}"` : ""} ${r.sku ? `data-sku="${r.sku}"` : ""}`;
+      if (c === "priority") td.innerHTML = `<select data-item-id="${key}" ${stableAttrs} data-col="${c}" aria-label="${key} priority"><option>Low</option><option>Normal</option><option>High</option></select>`;
+      else if (c === "status") td.innerHTML = `<select data-item-id="${key}" ${stableAttrs} data-col="${c}" aria-label="${key} status"><option>Open</option><option>In Progress</option><option>Waiting</option><option>Closed</option></select>`;
+      else if (c === "note") td.innerHTML = `<input data-item-id="${key}" ${stableAttrs} data-col="${c}" aria-label="${key} internal note">`;
+      else if (c === "reorderQty") td.innerHTML = `<input type="number" data-item-id="${key}" ${stableAttrs} data-col="${c}" aria-label="${key} reorder quantity">`;
+      else td.textContent = r[c];
+      tr.appendChild(td);
+    }
+    const save = document.createElement("td"); save.innerHTML = `<button data-save-id="${key}" data-task-role="save-button" aria-label="save ${kind} ${key}">Save</button>`; tr.appendChild(save); tb.appendChild(tr);
+  });
+  wrap.querySelectorAll("[data-item-id]").forEach(el => { const row = rows.find(r => (r.id || r.sku) === el.dataset.itemId); el.value = row[el.dataset.col]; el.addEventListener("input", () => { row[el.dataset.col] = el.value; }); });
+  wrap.querySelectorAll("[data-save-id]").forEach(btn => btn.addEventListener("click", e => onSave(rows.find(r => (r.id || r.sku) === btn.dataset.saveId), e)));
+  return wrap;
+}
+function saveTicket(t, e){ countAction("save-ticket"); saveState(); audit({ kind:"ticket-save", id:t.id, trusted:e?.isTrusted }); render(); }
+function saveInventory(i, e){ countAction("save-inventory"); i.reorderQty = Number(i.reorderQty); saveState(); audit({ kind:"inventory-save", id:i.sku, trusted:e?.isTrusted }); render(); }
+function messageComposer(){
+  const wrap = document.createElement("div"); wrap.className="card";
+  wrap.innerHTML = `<label>From <input id="msgFrom" aria-label="message from" value="Agent"></label><br><br><label>To <select id="msgTo"><option>Billing</option><option>Support</option><option>Warehouse</option></select></label><br><br><label>Subject <input id="msgSubject" aria-label="message subject"></label><br><br><label>Body <textarea id="msgBody" aria-label="message body"></textarea></label><br><button id="sendMsg" data-task-role="send-message">Send message</button><h3>Sent messages</h3><div id="sent"></div>`;
+  wrap.querySelector("#sendMsg").addEventListener("click", e => { countAction("send-message"); state.messages.push({ from:msgFrom.value, to:msgTo.value, subject:msgSubject.value, body:msgBody.value, trusted:e.isTrusted }); audit({ kind:"message-send", id:msgSubject.value, trusted:e.isTrusted }); render(); });
+  wrap.querySelector("#sent").appendChild(readTable(state.messages, ["from","to","subject","body"]));
+  return wrap;
+}
+function assignBids(){ document.querySelectorAll("button,input,select,textarea,a[href]").forEach(el => { const id = `b${(++bidCounter).toString(36)}`; el.setAttribute("bid", id); el.setAttribute("data-bid", id); const r = el.getBoundingClientRect(); el.setAttribute("browsergym_visibility_ratio", (r.width > 0 && r.height > 0 ? 1 : 0).toString()); }); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+async function runCheat(){ const fn = window.ChoreDeskCheats?.run?.[task]; if (fn) await fn(); else for (const step of (window.ChoreDeskCheats?.[task] || [])) console.log("cheat step", step); grade(true); }
+document.getElementById("reset").addEventListener("click", () => { localStorage.removeItem(storeKey); localStorage.removeItem(verdictKey); state = loadState(); render(); });
+document.getElementById("grade").addEventListener("click", () => grade(true));
+document.getElementById("cheat").addEventListener("click", () => runCheat());
+window.__task = { id:task, run, seed, goal:TASKS[task]?.instruction, difficulty:TASKS[task]?.difficulty, step:() => { const v=grade(false); return { observation:observation(), reward:v.reward, terminated:v.done, truncated:window.__taskTruncated, info:v.info }; }, reset:() => { localStorage.removeItem(storeKey); state=loadState(); render(); return { observation:observation(), info:{task,run,seed} }; }, rubric:() => rubric(), cheat:runCheat, validate, teardown:()=>undefined };
+window.__choredesk = window.__task;
+window.__choredesk.cheatHelpers = { route: async (v) => { route(v); await new Promise(r => setTimeout(r, 0)); }, set: (sel, value) => { const el = document.querySelector(sel); if (!el) throw new Error('cheat selector missing: ' + sel); el.value = value; el.dispatchEvent(new Event('input', { bubbles:true })); el.dispatchEvent(new Event('change', { bubbles:true })); } };
+state.viewsVisited[view] = (state.viewsVisited[view] || 0) + 1; saveState(); render();
+})();
+</script>
+</body>

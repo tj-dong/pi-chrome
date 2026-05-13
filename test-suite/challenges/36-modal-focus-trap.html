@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>36 modal focus trap</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: open modal, use Tab to cycle focus inside modal only, then Escape closes it and focus returns to opener.</p>
+  <button id="open">Open modal</button>
+  <div id="modal" role="dialog" aria-modal="true" aria-label="Focus trap modal" hidden style="position:fixed;inset:20%;background:#222;border:2px solid #6cf;border-radius:10px;padding:20px;z-index:5">
+    <button id="first">First</button>
+    <input id="middle" aria-label="Modal input">
+    <button id="last">Last</button>
+  </div>
+</main>
+<script>
+Challenge.init({ id: "modal-focus-trap", instructions: "open modal, Tab cycles inside, Escape closes" });
+const order = [];
+const modal = document.getElementById("modal");
+const nodes = [first, middle, last];
+let escaped = false, modalOpened = false, outsideFocusWhileOpen = false;
+for (const el of [open, ...nodes]) el.addEventListener("focus", () => { order.push(el.id); Challenge.log("focus", { id: el.id }); });
+document.addEventListener("focusin", e => {
+  if (modalOpened && !modal.hidden && !modal.contains(e.target)) outsideFocusWhileOpen = true;
+});
+open.addEventListener("click", () => { modal.hidden = false; modalOpened = true; first.focus(); });
+document.addEventListener("keydown", e => {
+  if (modal.hidden) return;
+  if (e.key === "Tab") {
+    const i = nodes.indexOf(document.activeElement);
+    if (i >= 0) { e.preventDefault(); nodes[(i + (e.shiftKey ? -1 : 1) + nodes.length) % nodes.length].focus(); }
+  }
+  if (e.key === "Escape") { modal.hidden = true; escaped = true; open.focus(); queueMicrotask(check); }
+});
+function hasAdjacent(seq, a, b) {
+  return seq.some((x, i) => x === a && seq[i + 1] === b);
+}
+function check(){
+  const afterOpen = order.slice(order.indexOf("first"));
+  const bad = [];
+  if (!escaped) bad.push("Escape did not close modal");
+  if (document.activeElement !== open) bad.push("focus did not return to opener");
+  if (!afterOpen.includes("middle") || !afterOpen.includes("last")) bad.push(`focus cycle incomplete: ${afterOpen.join(">")}`);
+  if (!hasAdjacent(afterOpen, "last", "first") && !hasAdjacent(afterOpen, "first", "last")) bad.push(`no wrap-around focus trap observed: ${afterOpen.join(">")}`);
+  if (outsideFocusWhileOpen) bad.push("focus escaped outside modal while open");
+  if (bad.length) Challenge.fail(...bad); else Challenge.pass(`modal focus trap ok: ${afterOpen.join(">")}`);
+}
+</script>
+</body>

@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>MiniShop hermetic site</title>
+<link rel="stylesheet" href="../../../_style.css">
+<style>
+main{max-width:1100px}.products{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{border:1px solid #333;border-radius:10px;background:#202020;padding:12px}.cart{position:sticky;top:8px;background:#111;border:1px solid #555;border-radius:10px;padding:12px;margin-bottom:12px}.red{color:#ff8b8b}.blue{color:#8bbcff}.green{color:#9f9}.muted{color:#aaa;font-size:12px}</style>
+<body>
+<main>
+<h1>MiniShop</h1>
+<div class="cart"><b>Cart</b> <span id="cartCount">0</span> items <button id="checkout" data-task-role="checkout">Checkout</button> <span id="order"></span> <span id="reward" class="muted"></span><div id="cartItems"></div></div>
+<p id="taskText"></p>
+<section class="products" id="productsEl"></section>
+</main>
+<script src="grader.js?v=2"></script>
+<script src="cheats.js?v=2"></script>
+<script>
+(function(){
+const params=new URLSearchParams(location.search);
+if(!params.get('run')){params.set('run', crypto.randomUUID ? crypto.randomUUID() : String(Date.now())); history.replaceState(null,'',`?${params}`);}
+const task=params.get('task')||'mini-shop-red-second-cheapest'; const run=params.get('run'); const seed=Number(params.get('seed')||0);
+const key=`mini-shop:${task}:${run}:${seed}`;
+const products=[
+ {id:'p1',name:'Crimson Mug',color:'red',price:12.00},
+ {id:'p2',name:'Ruby Notebook',color:'red',price:7.50},
+ {id:'p3',name:'Scarlet Pen',color:'red',price:3.25},
+ {id:'p4',name:'Blue Cable',color:'blue',price:5.10},
+ {id:'p5',name:'Green Mat',color:'green',price:9.00},
+ {id:'p6',name:'Red Stapler',color:'red',price:18.00},
+ {id:'p7',name:'Blue Lamp',color:'blue',price:22.00},
+ {id:'p8',name:'Green Clip',color:'green',price:2.40}
+];
+let state=JSON.parse(localStorage.getItem(key)||'{"cart":[],"orderId":"","actionCount":0,"startedAt":0}');
+if(!state.startedAt) state.startedAt=Date.now();
+taskText.textContent='Task: add the second-cheapest red product to cart, checkout, and leave order id visible.';
+function save(){localStorage.setItem(key,JSON.stringify(state)); window.__miniShopState=state; const v=MiniShopGrader.grade(task,state,products,run,seed); window.__taskReward=v.reward; window.__taskTerminated=v.done; window.__taskInfo=v.info; reward.textContent=`reward=${v.reward} actions=${state.actionCount||0}`; renderCart();}
+function assignBids(){let n=0; document.querySelectorAll('button,a,input,select,textarea').forEach(el=>{const bid='b'+(++n).toString(36); el.setAttribute('bid',bid); el.setAttribute('data-bid',bid); const r=el.getBoundingClientRect(); el.setAttribute('browsergym_visibility_ratio',(r.width&&r.height?1:0).toString());});}
+function render(){productsEl.innerHTML=''; products.forEach(p=>{const d=document.createElement('div');d.className='card';d.innerHTML=`<h3 class="${p.color}">${p.name}</h3><p>Color: ${p.color}</p><p>Price: $${p.price.toFixed(2)}</p><button aria-label="add ${p.name}" data-id="${p.id}" data-task-role="add-to-cart">Add to cart</button>`;productsEl.appendChild(d)});document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>{state.actionCount=(state.actionCount||0)+1;state.cart.push(b.dataset.id);save()});renderCart();assignBids();}
+function renderCart(){
+  cartCount.textContent=state.cart.length; order.textContent=state.orderId?`Order ${state.orderId}`:'';
+  cartItems.innerHTML=state.cart.map((id,i)=>{const p=products.find(x=>x.id===id);return `<div>${p?.name||id} <button data-remove-index="${i}" aria-label="remove ${p?.name||id}" data-task-role="remove-from-cart">Remove</button></div>`}).join('');
+  cartItems.querySelectorAll('[data-remove-index]').forEach(b=>b.onclick=()=>{state.actionCount=(state.actionCount||0)+1;state.cart.splice(Number(b.dataset.removeIndex),1);save();render();});
+  assignBids();
+}
+function orderId(){ return 'MS-' + String(1000 + ((seed * 2654435761 + state.cart.join('').length * 97) % 9000)).padStart(4, '0'); }
+checkout.onclick=()=>{state.actionCount=(state.actionCount||0)+1;state.orderId=orderId();save();};
+function observation(){return {goal:taskText.textContent,url:location.href,title:document.title,reward:window.__taskReward,actionCount:state.actionCount||0,focusedElementBid:document.activeElement?.getAttribute('bid')||null};}
+async function runCheat(){const fn=window.MiniShopCheats?.run?.[task]; if(fn) await fn(); else for(const step of (window.MiniShopCheats?.[task]||[])) console.log('cheat step',step); save();}
+window.__miniShopState=state; window.__miniShopProducts=products; window.__miniShopTask=task;
+window.__task={id:task,run,seed,goal:taskText.textContent,difficulty:'L2',step:()=>{const v=MiniShopGrader.grade(task,state,products,run,seed);return {observation:observation(),reward:v.reward,terminated:v.done,truncated:false,info:v.info}},reset:()=>{localStorage.removeItem(key);state={cart:[],orderId:'',actionCount:0,startedAt:Date.now()};render();save();return {observation:observation(),info:{task,run,seed}}},rubric:()=>MiniShopGrader.validate(task,state,products,run,seed).info.rubric,cheat:runCheat,validate:()=>MiniShopGrader.validate(task,state,products,run,seed),teardown:()=>undefined};
+window.__miniShop=window.__task;
+window.__miniShop.cheatHelpers={click:(sel)=>document.querySelector(sel).click()};
+render(); save();
+})();
+</script>
+</body>

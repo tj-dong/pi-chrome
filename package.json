@@ -1,22 +1,55 @@
 {
 	"name": "pi-chrome",
-	"version": "0.14.2",
-	"description": "Drive your existing logged-in Chrome from Pi — no re-login, no throwaway profile, watch the agent work in real time (or toggle quiet background mode).",
+	"version": "0.14.7",
+	"description": "The de-facto browser automation toolkit for Pi agents. Drive your existing logged-in Chrome — no re-login, no throwaway profile, no CDP. 20+ tools (click, type, navigate, screenshot, network capture, file upload, drag, scroll, touch) + honest result envelopes + a built-in benchmark suite.",
 	"keywords": [
+		"pi",
 		"pi-package",
 		"pi-extension",
+		"pi-agent",
 		"chrome",
+		"chrome-extension",
 		"browser",
-		"automation",
+		"browser-automation",
+		"browser-control",
+		"web-automation",
+		"agent",
+		"ai-agent",
+		"llm-agent",
+		"llm-tools",
+		"agentic",
+		"playwright-alternative",
+		"puppeteer-alternative",
+		"selenium-alternative",
+		"cdp-alternative",
 		"authenticated-session",
 		"real-profile",
-		"web-debugging"
+		"web-debugging",
+		"web-scraping",
+		"screenshot",
+		"automation-tools",
+		"browser-use",
+		"stagehand-alternative"
 	],
 	"license": "MIT",
+	"homepage": "https://github.com/tianrendong/pi-packs/tree/main/packages/pi-chrome#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tianrendong/pi-packs.git",
+		"directory": "packages/pi-chrome"
+	},
+	"bugs": {
+		"url": "https://github.com/tianrendong/pi-packs/issues"
+	},
 	"type": "commonjs",
 	"files": [
 		"extensions",
-		"README.md"
+		"docs",
+		"README.md",
+		"CHANGELOG.md",
+		"CONTRIBUTING.md",
+		"SECURITY.md",
+		"LICENSE"
 	],
 	"pi": {
 		"extensions": [

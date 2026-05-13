@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pi-chrome long-horizon task manifest",
+  "description": "BrowserGym-inspired task manifest: setup URL, deterministic seed, goal object, action subsets, reward contract, optional cheat recipe, and in-page validate hook.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "taskId", "site", "startUrl", "setupUrl", "difficulty", "category", "goal", "goalObject", "grader", "actionSubsets", "maxSteps"],
+    "additionalProperties": true,
+    "properties": {
+      "id": { "type": "string" },
+      "taskId": { "type": "string" },
+      "site": { "type": "string" },
+      "seed": { "type": "integer" },
+      "startUrl": { "type": "string", "description": "Relative URL. $RUN_ID and $SEED should be replaced by runner for isolated deterministic state." },
+      "setupUrl": { "type": "string" },
+      "validateScript": { "type": "string" },
+      "cheatScript": { "type": "string" },
+      "viewport": { "type": "object", "properties": { "width": { "type": "integer" }, "height": { "type": "integer" } } },
+      "slowMoMs": { "type": "integer" },
+      "timeoutMs": { "type": "integer" },
+      "locale": { "type": ["string", "null"] },
+      "timezoneId": { "type": ["string", "null"] },
+      "difficulty": { "enum": ["L1", "L2", "L3"] },
+      "category": { "enum": ["enterprise-crud", "cross-page-memory", "cross-page-state-update", "task-completion"] },
+      "gradeSource": { "enum": ["page", "harness", "both"] },
+      "tags": { "type": "array", "items": { "type": "string" } },
+      "intent": { "type": "string" },
+      "goal": { "type": "string" },
+      "goalObject": { "type": "array", "items": { "type": "object" } },
+      "expectedActions": { "type": "object", "required": ["min", "max"], "properties": { "min": { "type": "integer" }, "max": { "type": "integer" } } },
+      "maxSteps": { "type": "integer" },
+      "humanBaseline": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+      "actionSubsets": { "type": "array", "items": { "enum": ["chat", "infeas", "bid", "coord", "nav", "tab"] } },
+      "allowedActions": { "type": "array", "items": { "type": "string" } },
+      "requires": { "type": "array", "items": { "type": "string" } },
+      "rewardShape": { "enum": ["binary", "graded", "shaped"] },
+      "rubric": { "type": "array", "items": { "type": "object", "required": ["id", "weight", "description"], "properties": { "id": { "type": "string" }, "weight": { "type": "number" }, "description": { "type": "string" } } } },
+      "grader": {
+        "type": "object",
+        "required": ["type", "expression", "passValue"],
+        "properties": {
+          "type": { "enum": ["inPageProgrammatic"] },
+          "expression": { "type": "string", "description": "Should evaluate to BrowserGym-like validate object or legacy {v,r}." },
+          "passValue": { "type": "string" }
+        }
+      },
+      "browserGymLike": {
+        "type": "object",
+        "properties": {
+          "observation": { "type": "array", "items": { "type": "string" } },
+          "actionSpace": { "type": "array", "items": { "type": "string" } },
+          "reset": { "type": "string" },
+          "stepReturn": { "const": "obs,reward,terminated,truncated,info" }
+        }
+      }
+    }
+  }
+}

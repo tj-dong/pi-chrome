@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>34 dialog handling</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: handle browser dialogs. Click Prompt, enter <code>pi-chrome</code>, accept it; then click Confirm and accept it. Browser automation must expose/dismiss native dialogs.</p>
+  <button id="promptBtn">Prompt</button>
+  <button id="confirmBtn">Confirm</button>
+  <button id="alertBtn">Alert smoke</button>
+  <pre id="rep" class="code"></pre>
+</main>
+<script>
+Challenge.init({ id: "dialog-handling", instructions: "accept prompt('pi-chrome') and confirm()" });
+const state = { prompt: null, confirm: null, alert: false };
+function paint(){ rep.textContent = JSON.stringify(state, null, 2); }
+function check(){
+  paint();
+  if (state.prompt === "pi-chrome" && state.confirm === true) Challenge.pass("prompt and confirm handled with expected values");
+}
+promptBtn.addEventListener("click", () => { state.prompt = prompt("Enter token", ""); Challenge.log("prompt-result", { value: state.prompt }); check(); });
+confirmBtn.addEventListener("click", () => { state.confirm = confirm("Accept benchmark confirm?"); Challenge.log("confirm-result", { value: state.confirm }); check(); });
+alertBtn.addEventListener("click", () => { alert("pi-chrome alert smoke"); state.alert = true; Challenge.log("alert-dismissed", {}); paint(); });
+window.addEventListener("beforeunload", e => { e.preventDefault(); e.returnValue = "benchmark beforeunload"; });
+paint();
+</script>
+</body>

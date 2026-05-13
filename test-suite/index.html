@@ -35,6 +35,13 @@
   <tbody></tbody>
 </table>
 
+<h2>Long-horizon hermetic tasks</h2>
+<p class="hint">These WebArena/BrowserGym-inspired tasks use deterministic in-page graders and fresh <code>$RUN_ID</code> state. They test multi-step browser work beyond event fidelity.</p>
+<table id="taskTbl">
+  <thead><tr><th>id</th><th>difficulty</th><th>category</th><th>intent</th><th>requires</th><th>open</th></tr></thead>
+  <tbody></tbody>
+</table>
+
 <h2>Agent run loop</h2>
 <pre class="code">python3 -m http.server 8765
 # For each manifest entry:
@@ -46,7 +53,9 @@
 </main>
 <script>
 let manifest = [];
+let taskManifest = [];
 const tbody = document.querySelector("#tbl tbody");
+const taskTbody = document.querySelector("#taskTbl tbody");
 const modeEl = document.getElementById("mode");
 const filterEl = document.getElementById("filter");
 
@@ -123,9 +132,28 @@ function paint() {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+function paintTasks() {
+  taskTbody.innerHTML = "";
+  const run = "manual-" + new Date().toISOString().slice(0,10);
+  for (const t of taskManifest) {
+    const url = t.startUrl.replaceAll("$RUN_ID", run).replaceAll("$SEED", String(t.seed ?? 0));
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><code>${t.taskId || t.id}</code><div class="notes">seed=${t.seed ?? 0} maxSteps=${t.maxSteps ?? "—"}</div></td>
+      <td><span class="pill expected">${t.difficulty}</span></td>
+      <td>${t.category}</td>
+      <td>${escapeHtml(t.goal || t.intent)}</td>
+      <td><div class="notes">${escapeHtml((t.requires || []).join(", "))}</div><div class="notes">actions: ${escapeHtml((t.actionSubsets || []).join(", "))}</div></td>
+      <td><a target="_blank" href="${url}">open</a></td>
+    `;
+    taskTbody.appendChild(tr);
+  }
+}
 async function init() {
   manifest = await fetch("manifest.json", { cache: "no-store" }).then(r => r.json());
+  taskManifest = await fetch("task-manifest.json", { cache: "no-store" }).then(r => r.json()).catch(() => []);
   paint();
+  paintTasks();
 }
 document.getElementById("refresh").addEventListener("click", paint);
 document.getElementById("clear").addEventListener("click", () => {
