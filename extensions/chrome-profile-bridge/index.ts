@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -679,6 +681,81 @@ Usage rules:
 		ctx.ui.notify(await statusSummary(), "info");
 	};
 
+	// Interactive dialog: each row is a setting whose value cycles with Space/Enter. Enter on
+	// the last value also saves; Esc / 'q' closes. The description below changes with the
+	// current value so users always see what the active setting means.
+	const openSettingsDialog = async (ctx: ExtensionContext): Promise<void> => {
+		// Read current click mode (might fail if extension permission missing).
+		let clicksMode: string = "auto";
+		let permissionGranted = false;
+		try {
+			const t = (await bridge.send("trusted.status", {}, 5_000)) as { mode?: string; permissionGranted?: boolean };
+			clicksMode = t.mode ?? "auto";
+			permissionGranted = !!t.permissionGranted;
+		} catch {}
+
+		const clicksItem: SettingItem = {
+			id: "clicks",
+			label: "Click realism",
+			currentValue: clicksMode,
+			values: ["auto", "on", "off"],
+			description: permissionGranted
+				? (CLICKS_DESC[clicksMode] ?? "")
+				: "Real-looking clicks unavailable: reload the Chrome extension in chrome://extensions and accept the new permission prompt.",
+		};
+		const quietItem: SettingItem = {
+			id: "quiet",
+			label: "Quiet mode",
+			currentValue: backgroundDefault ? "on" : "off",
+			values: ["on", "off"],
+			description: QUIET_DESC[backgroundDefault ? "on" : "off"] ?? "",
+		};
+		const items: SettingItem[] = [clicksItem, quietItem];
+
+		await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+			const container = new Container();
+			container.addChild(new Text(theme.fg("accent", theme.bold("pi-chrome settings")), 1, 1));
+			container.addChild(new Text(theme.fg("muted", "\u2191\u2193 navigate · space/enter cycle · esc close"), 1, 0));
+
+			let list: SettingsList;
+			list = new SettingsList(
+				items,
+				Math.min(items.length + 2, 8),
+				getSettingsListTheme(),
+				(id, newValue) => {
+					if (id === "clicks") {
+						if (!permissionGranted) {
+							ctx.ui.notify("Click mode locked: reload the Chrome extension first.", "warning");
+							// Revert by snapping back to the previous value.
+							list.updateValue("clicks", clicksItem.currentValue);
+							return;
+						}
+						// Mutate description so the help text matches the new value.
+						clicksItem.currentValue = newValue;
+						clicksItem.description = CLICKS_DESC[newValue] ?? "";
+						list.invalidate();
+						void bridge.send("trusted.mode", { mode: newValue }, 5_000).catch((err) => {
+							ctx.ui.notify(`Couldn't switch click mode: ${(err as Error).message}`, "warning");
+						});
+					} else if (id === "quiet") {
+						backgroundDefault = newValue === "on";
+						quietItem.currentValue = newValue;
+						quietItem.description = QUIET_DESC[newValue] ?? "";
+						list.invalidate();
+					}
+				},
+				() => done(undefined),
+			);
+			container.addChild(list);
+
+			return {
+				render: (w) => container.render(w),
+				invalidate: () => container.invalidate(),
+				handleInput: (data: string) => list.handleInput(data),
+			};
+		});
+	};
+
 	pi.registerCommand("chrome", {
 		description:
 			"All pi-chrome controls in one place.\n  /chrome status   — one-line snapshot of connection + current modes.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome clicks [auto|off|on|status]  — how realistic should pi-chrome's clicks be.\n  /chrome quiet  [on|off|status|toggle] — whether Chrome pops to the front when pi-chrome acts.\nRun with no arguments for an interactive picker that shows current state.",
@@ -727,32 +804,7 @@ Usage rules:
 		handler: async (args, ctx) => {
 			const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0) {
-				const header = await statusSummary();
-				// Compute next-cycle targets so the picker labels describe the toggle action.
-				let clicksNow = "?";
-				try {
-					const t = (await bridge.send("trusted.status", {}, 3_000)) as { mode?: string };
-					clicksNow = t.mode ?? "?";
-				} catch {}
-				const clicksNext = (() => {
-					const idx = CLICKS_CYCLE.indexOf(clicksNow as typeof CLICKS_CYCLE[number]);
-					return idx >= 0 ? CLICKS_CYCLE[(idx + 1) % CLICKS_CYCLE.length] : "auto";
-				})();
-				const quietNow = backgroundDefault ? "on" : "off";
-				const quietNext = backgroundDefault ? "off" : "on";
-				const picked = await ctx.ui.select(`pi-chrome — ${header}`, [
-					`status — print the line above (so you can copy it).`,
-					`doctor — full health check; explains anything broken.`,
-					`onboard — install the Chrome companion extension (first-time setup).`,
-					`clicks: ${clicksNow} → switch to ${clicksNext} — ${CLICKS_DESC[clicksNext] ?? ""}`,
-					`quiet: ${quietNow} → switch to ${quietNext} — ${QUIET_DESC[quietNext] ?? ""}`,
-				]);
-				if (!picked) return;
-				if (picked.startsWith("status")) return statusHandler(ctx);
-				if (picked.startsWith("doctor")) return doctorHandler(ctx);
-				if (picked.startsWith("onboard")) return onboardHandler(ctx);
-				if (picked.startsWith("clicks")) return trustedHandler(ctx, ""); // cycles
-				if (picked.startsWith("quiet")) return backgroundHandler(ctx, ""); // toggles
+				await openSettingsDialog(ctx);
 				return;
 			}
 			const [head, ...rest] = tokens;
