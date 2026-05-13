@@ -124,7 +124,7 @@ If the Chrome extension you have loaded is older than `pi-chrome` on disk, `/chr
 ## Compose with
 
 - **pi-qq** — ask side questions about what the agent saw in Chrome without polluting the main transcript: `/qq summarize what the active GitHub tab shows`.
-- **trifecta-footer** — watch context pressure as the agent scrapes large pages; the footer's red threshold is a clean signal to `/qq` for a recap before context overflows.
+- **pi-bar** — watch context pressure as the agent scrapes large pages; the footer's red threshold is a clean signal to `/qq` for a recap before context overflows.
 - **PR demo skills** (such as `ios-pr-agent` / `ios-demo-record` workflows) — `chrome_screenshot` writes to `.pi/chrome-screenshots/` so you can attach images to PR descriptions or demo bundles.
 
 ## Tools

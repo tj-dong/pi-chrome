@@ -46,7 +46,8 @@ type BridgeResult = {
 	error?: string;
 };
 
-const PI_CHROME_VERSION = "0.7.0";
+const PI_CHROME_VERSION = "0.8.0";
+const PI_CHROME_GLOBAL_KEY = "__piChromeProfileBridgeLoaded__";
 const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
 const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -83,7 +84,30 @@ function workspaceCwd(ctx: ExtensionContext): string {
 
 function browserExtensionPath(): string {
 	return join(extensionRoot(), "browser-extension");
-} 
+}
+
+function hostnameOf(url: string | undefined): string {
+	if (!url) return "";
+	try { return new URL(url).hostname; } catch { return ""; }
+}
+
+// Description of a click/type/fill result's significant fields so the agent doesn't have to
+// guess whether the action actually changed the page.
+function summarizeActionResult(result: unknown): string | undefined {
+	if (!result || typeof result !== "object") return undefined;
+	const r = result as Record<string, unknown>;
+	const parts: string[] = [];
+	if (r.pageMutated === false) parts.push("pageMutated=false");
+	if (r.defaultPrevented === true) parts.push("defaultPrevented=true");
+	if (r.elementVisible === false) parts.push("element NOT visible");
+	if (r.occludedBy) {
+		const o = r.occludedBy as { tag?: string; id?: string };
+		parts.push(`occluded by <${o.tag ?? "?"}${o.id ? "#" + o.id : ""}>`);
+	}
+	if (r.valueMatches === false) parts.push("input value did not stick");
+	if (r.autoplayHint) parts.push("autoplay-gated affordance — synthetic click may not start media");
+	return parts.length ? parts.join("; ") : undefined;
+}
 
 function readRequestBody(request: IncomingMessage): Promise<string> {
 	return new Promise((resolveBody, rejectBody) => {
@@ -338,6 +362,18 @@ const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 
 export default function (pi: ExtensionAPI): void {
+	const globalState = globalThis as typeof globalThis & {
+		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string };
+	};
+	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
+	if (alreadyLoaded) {
+		console.warn(
+			`pi-chrome already loaded from ${alreadyLoaded.root} (v${alreadyLoaded.version}); skipping duplicate from ${extensionRoot()}.`,
+		);
+		return;
+	}
+	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: extensionRoot() };
+
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = false;
 
@@ -374,21 +410,34 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => {
 		const primer = `
 <chrome-profile-bridge>
-Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile.
-This is not CDP: it can use the user's existing Chrome windows and authenticated sessions after the user loads the companion browser extension.
-If chrome_* tools time out, ask the user to run /chrome-onboard, then load the bundled browser-extension folder in chrome://extensions. Prefer chrome_snapshot before clicking/typing; use stable element uids from snapshots with chrome_click/chrome_type when available. For form work, use includeSnapshot=true on actions to verify in one round trip. Avoid destructive actions unless explicitly requested. By default chrome_* tools focus Chrome and activate the target tab so the user can watch the agent work. The user can switch to silent/background mode for the whole session via /chrome-background; you can also pass background=true on a single tool call when the user explicitly wants the action to be silent (for example, scraping while they keep working in another app).
+Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile, no CDP, no throwaway profile.
+
+Capability model (important):
+- All input is **synthetic DOM events** (\`isTrusted=false\`). Synthetic events drive React/Vue/Angular state fine, but they do NOT satisfy Chrome's user-activation gates: audio/video autoplay, clipboard write, file pickers, fullscreen, and Web Push prompts will NOT open from a chrome_click.
+- \`chrome_evaluate\` runs in MAIN world via the Function constructor. It works on pages with strict CSP (\`script-src 'self'\` without \`'unsafe-eval'\`), and surfaces thrown exceptions.
+- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If \`pageMutated\` is false after a click that should have changed something, the click likely didn't take effect — do NOT just retry; check the action result and snapshot for the cause.
+
+Usage rules:
+1. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
+2. \`includeSnapshot=true\` on click/type/fill to verify in one round trip.
+3. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
+4. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
+5. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome-background to silence the whole session.
+6. If you hit an autoplay/clipboard/file-picker gate, tell the user; this bridge cannot satisfy it.
+7. Run /chrome-doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
 		return { systemPrompt: event.systemPrompt + primer };
 	});
 
 	pi.registerCommand("chrome-doctor", {
 		description:
-			"Check Chrome bridge connectivity and diagnose setup. Reports the local bridge, companion Chrome extension status (ID + version), and a one-line fix for common failures (extension not loaded, stale service worker, version drift).",
+			"Check Chrome bridge connectivity and capability tier. Probes the local bridge, the companion Chrome extension, MAIN-world evaluation, and CDP availability, and prints one-line fixes for common failures.",
 		handler: async (_args, ctx) => {
 			ctx.ui.notify("Performing Chrome bridge health check", "info");
 			const lines: string[] = [`pi-chrome v${PI_CHROME_VERSION}`];
 			const status = bridge.status();
 			lines.push(`• Local bridge: mode=${status.mode}, url=${status.url}`);
+			let extensionAlive = false;
 			try {
 				const started = Date.now();
 				const version = (await bridge.send("tab.version", {}, 35_000)) as {
@@ -397,10 +446,8 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 					bridgeUrl?: string;
 				};
 				const latencyMs = Date.now() - started;
-				if (version.extensionId)
-					lines.push(`✓ Companion Chrome extension responding (ID: ${version.extensionId}, ext v${version.extensionVersion ?? "unknown"}, latency ${latencyMs}ms)`);
-				else lines.push(`✓ Companion Chrome extension responding (no extension ID reported, latency ${latencyMs}ms)`);
-				if (version.bridgeUrl) lines.push(`• Extension polling: ${version.bridgeUrl}`);
+				extensionAlive = true;
+				lines.push(`✓ Companion Chrome extension responding (ID: ${version.extensionId ?? "?"}, ext v${version.extensionVersion ?? "?"}, latency ${latencyMs}ms)`);
 				if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
 					lines.push(
 						`⚠ Extension version (${version.extensionVersion}) differs from pi-chrome (${PI_CHROME_VERSION}). Reload "Pi Existing Chrome Profile Bridge" in chrome://extensions to pick up the latest service worker.`,
@@ -415,6 +462,43 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 					lines.push("  Fix: run /chrome-onboard, then load the bundled browser-extension folder in chrome://extensions and keep that Chrome window open.");
 				}
 			}
+
+			if (extensionAlive) {
+				// MAIN-world evaluate probe.
+				try {
+					const value = await bridge.send("page.evaluate", { expression: "1+1", awaitPromise: true, foreground: false }, 10_000);
+					if (value === 2) lines.push(`✓ chrome_evaluate("1+1") = 2`);
+					else lines.push(`⚠ chrome_evaluate("1+1") returned ${JSON.stringify(value)} (expected 2). The current tab may have a restrictive CSP or be a chrome:// URL.`);
+				} catch (error) {
+					lines.push(`✗ chrome_evaluate failed: ${(error as Error).message}`);
+				}
+
+				// Capability probe via MAIN-world helper.
+				try {
+					const probe = (await bridge.send("page.probe", { foreground: false }, 10_000)) as Record<string, unknown>;
+					if (probe && probe.arithmetic === 2) lines.push(`✓ MAIN-world helper injection works (location=${hostnameOf(String(probe.location))})`);
+					if (probe && probe.webdriver) lines.push(`⚠ navigator.webdriver=true on current tab — site fingerprinting may flag automation.`);
+				} catch (error) {
+					lines.push(`⚠ page.probe failed: ${(error as Error).message}`);
+				}
+			}
+
+			// CDP availability hint.
+			try {
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), 250);
+				const response = await fetch("http://127.0.0.1:9222/json/version", { signal: controller.signal }).catch(() => undefined);
+				clearTimeout(timer);
+				if (response && response.ok) {
+					const info = (await response.json().catch(() => ({}))) as { Browser?: string };
+					lines.push(`✓ CDP endpoint reachable at 127.0.0.1:9222 (${info.Browser ?? "unknown"}). Trusted input via CDP is not yet wired into pi-chrome — reserved for a future release.`);
+				} else {
+					lines.push(`• CDP not available (no listener on 127.0.0.1:9222). Synthetic input only; autoplay/clipboard/file-picker gates cannot be satisfied. Future pi-chrome versions will use CDP for trusted input when this port is enabled.`);
+				}
+			} catch {
+				lines.push(`• CDP probe inconclusive.`);
+			}
+
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
@@ -540,6 +624,9 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS })),
+			containingText: Type.Optional(Type.String({ description: "Only return elements whose label/text contains this string (case-insensitive). Useful when the page has many controls." })),
+			roleFilter: Type.Optional(Type.String({ description: "Only return elements matching this ARIA role or tag name (case-insensitive). e.g. 'button', 'link', 'textbox'." })),
+			nearUid: Type.Optional(Type.String({ description: "Sort elements by proximity to this snapshot uid. Useful for finding controls near a known anchor." })),
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, run silently in the background without focusing Chrome. Default false (Chrome focuses + tab activates so the user can watch)." }),
 			),
@@ -569,6 +656,7 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			titleIncludes: Type.Optional(Type.String()),
 			waitUntilLoad: Type.Optional(Type.Boolean({ default: true })),
 			timeoutMs: Type.Optional(Type.Number({ default: 15_000 })),
+			initScript: Type.Optional(Type.String({ description: "Optional JavaScript source to run in MAIN world at document_start of the next navigation. Useful for seeding localStorage, stubbing Date.now(), or defining navigator.webdriver=undefined. Requires the companion extension's webNavigation permission." })),
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, navigate silently without focusing Chrome. Default false." }),
 			),
@@ -576,8 +664,8 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.navigate", withBackground(params), params.timeoutMs ?? 15_000);
-			return { content: [{ type: "text", text: `Navigated to ${params.url}` }], details: { result: result as Json } };
+			const result = await bridge.send("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000);
+			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
 		},
 	});
 
@@ -590,7 +678,6 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 		parameters: Type.Object({
 			expression: Type.String(),
 			awaitPromise: Type.Optional(Type.Boolean({ default: true })),
-			returnByValue: Type.Optional(Type.Boolean({ default: true })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -602,7 +689,12 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
 			const value = await bridge.send("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: truncateText(typeof value === "string" ? value : safeJson(value)) }], details: { value: value as Json } };
+			const text = value === undefined
+				? "undefined"
+				: typeof value === "string"
+					? value
+					: safeJson(value) ?? "undefined";
+			return { content: [{ type: "text", text: truncateText(text) }], details: { value: value as Json } };
 		},
 	});
 
@@ -629,8 +721,12 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.click", withBackground(params), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: `Clicked ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
+			const raw = await bridge.send("page.click", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
+			const summary = summarizeActionResult(result);
+			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
+			const text = summary ? `Clicked ${target} — ${summary}` : `Clicked ${target}`;
+			return { content: [{ type: "text", text }], details: { result: raw as Json } };
 		},
 	});
 
@@ -657,8 +753,12 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.type", withBackground(params), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: `Typed ${params.text.length} character(s)${params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : ""}.` }], details: { result: result as Json } };
+			const raw = await bridge.send("page.type", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
+			const summary = summarizeActionResult(result);
+			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
+			const base = `Typed ${params.text.length} character(s)${into}.`;
+			return { content: [{ type: "text", text: summary ? `${base} (${summary})` : base }], details: { result: raw as Json } };
 		},
 	});
 
@@ -685,8 +785,12 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: `Filled ${params.text.length} character(s)${params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : ""}.` }], details: { result: result as Json } };
+			const raw = await bridge.send("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
+			const summary = summarizeActionResult(result);
+			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
+			const base = `Filled ${params.text.length} character(s)${into}.`;
+			return { content: [{ type: "text", text: summary ? `${base} (${summary})` : base }], details: { result: raw as Json } };
 		},
 	});
 
@@ -710,8 +814,11 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.key", withBackground(params), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: `Pressed ${params.key}.` }], details: { result: result as Json } };
+			const raw = await bridge.send("page.key", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
+			const summary = summarizeActionResult(result);
+			const base = `Pressed ${params.key}.`;
+			return { content: [{ type: "text", text: summary ? `${base} (${summary})` : base }], details: { result: raw as Json } };
 		},
 	});
 
@@ -825,11 +932,113 @@ If chrome_* tools time out, ask the user to run /chrome-onboard, then load the b
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			const result = (await bridge.send("page.screenshot", withBackground(params), DEFAULT_TIMEOUT_MS)) as { dataUrl: string; tab?: unknown };
-			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
+			const result = (await bridge.send("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS)) as {
+				dataUrl?: string;
+				tab?: unknown;
+				fullPage?: boolean;
+				dimensions?: { width: number; height: number; viewportHeight: number; dpr: number };
+				tiles?: Array<{ y: number; dataUrl: string }>;
+			};
 			await mkdir(dirname(outputPath), { recursive: true });
+			if (result.fullPage && result.tiles && result.dimensions) {
+				// Stitch via PNG if format is png; otherwise we fall back to writing tile files and a
+				// manifest. We avoid pulling in an image library by writing each tile next to the main
+				// path with a -tileN suffix and a stitched.json manifest.
+				const { width, height, viewportHeight, dpr } = result.dimensions;
+				const manifest: Array<{ path: string; y: number }> = [];
+				for (let i = 0; i < result.tiles.length; i++) {
+					const tile = result.tiles[i];
+					const tilePath = outputPath.replace(/(\.[^.]+)$/, `-tile${i}$1`);
+					const base64 = tile.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
+					await writeFile(tilePath, Buffer.from(base64, "base64"));
+					manifest.push({ path: tilePath, y: tile.y });
+				}
+				await writeFile(outputPath + ".json", JSON.stringify({ width, height, viewportHeight, dpr, tiles: manifest }, null, 2));
+				return {
+					content: [{ type: "text", text: `Saved ${result.tiles.length} full-page tile(s) for ${width}×${height}px page. Manifest: ${outputPath}.json` }],
+					details: { manifest: outputPath + ".json", tiles: manifest, dimensions: result.dimensions, tab: result.tab } as unknown as Record<string, unknown>,
+				};
+			}
+			if (!result.dataUrl) throw new Error("Screenshot returned no dataUrl");
+			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
 			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_hover",
+		label: "Chrome Hover",
+		description: "Hover over an element (synthetic pointerover/mouseover/pointermove) by uid, selector, or x/y. Triggers CSS :hover state and any JS hover handlers; isTrusted is false.",
+		promptSnippet: "Hover a Chrome element to trigger :hover / mouseover handlers.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			x: Type.Optional(Type.Number()),
+			y: Type.Optional(Type.Number()),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			const result = await bridge.send("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS);
+			return { content: [{ type: "text", text: `Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_drag",
+		label: "Chrome Drag",
+		description: "Synthetic pointer drag from one uid/selector/point to another. Dispatches pointerdown → multi-step pointermove → pointerup. Note: HTML5 DataTransfer is NOT synthesized, so native HTML5 drag-and-drop targets may not respond.",
+		promptSnippet: "Drag a Chrome element from one point to another.",
+		parameters: Type.Object({
+			fromUid: Type.Optional(Type.String()),
+			fromSelector: Type.Optional(Type.String()),
+			fromX: Type.Optional(Type.Number()),
+			fromY: Type.Optional(Type.Number()),
+			toUid: Type.Optional(Type.String()),
+			toSelector: Type.Optional(Type.String()),
+			toX: Type.Optional(Type.Number()),
+			toY: Type.Optional(Type.Number()),
+			steps: Type.Optional(Type.Number({ default: 12 })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_id, params): Promise<ToolTextResult> {
+			const result = await bridge.send("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS);
+			return { content: [{ type: "text", text: `Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}` }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_upload_file",
+		label: "Chrome Upload File",
+		description: "Programmatically set the files of an <input type=file> element from local file paths. Uses DataTransfer to populate input.files and dispatches input+change events. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
+		promptSnippet: "Attach local files to a Chrome <input type=file> without opening the native file picker.",
+		parameters: Type.Object({
+			uid: Type.Optional(Type.String()),
+			selector: Type.Optional(Type.String()),
+			paths: Type.Array(Type.String(), { description: "Local absolute file paths to upload." }),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const { readFile } = await import("node:fs/promises");
+			const { basename } = await import("node:path");
+			const cwd = workspaceCwd(ctx);
+			const files: Array<{ name: string; type: string; base64: string }> = [];
+			for (const p of params.paths) {
+				const abs = resolve(cwd, p);
+				const buf = await readFile(abs);
+				files.push({ name: basename(abs), type: "application/octet-stream", base64: buf.toString("base64") });
+			}
+			const result = await bridge.send("page.upload", withBackground({ ...params, files }), DEFAULT_TIMEOUT_MS);
+			return { content: [{ type: "text", text: `Uploaded ${files.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
 		},
 	});
 }
