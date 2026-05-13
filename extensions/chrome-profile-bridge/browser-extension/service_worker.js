@@ -60,6 +60,13 @@ async function maybeUpgradeToTrusted(kind, params, syntheticResult, trustedFn) {
   }
 }
 
+// Last few attach failures, kept for /chrome doctor + trusted.debug diagnostics.
+const attachDebugLog = [];
+function recordAttachEvent(entry) {
+  attachDebugLog.push({ ...entry, t: Date.now() });
+  if (attachDebugLog.length > 20) attachDebugLog.shift();
+}
+
 async function attachDebugger(tabId) {
   if (!chrome.debugger) throw new Error("chrome.debugger API unavailable; reload the extension to grant the new permission");
   if (attachedTabs.has(tabId)) {
@@ -67,26 +74,73 @@ async function attachDebugger(tabId) {
     entry.detachAt = Date.now() + TRUSTED_IDLE_DETACH_MS;
     return entry;
   }
+  // Before each attach, force-detach any stale CDP target this extension owns on the tab.
+  // Chrome sometimes keeps a half-dead session around (extension reload mid-attach, etc.) and
+  // surfaces it as "Cannot access a chrome-extension://" on the next attach attempt.
   try {
-    await chrome.debugger.attach({ tabId }, CDP_VERSION);
-  } catch (error) {
-    // Chrome occasionally rejects attach with "Cannot access a chrome-extension:// URL of
-    // different extension" right after a navigation, even when the target tab's URL is a
-    // normal page. Wait a tick, verify the tab is on a non-privileged URL, and retry once.
-    const msg = String(error?.message || error);
-    const transient = /Cannot access a chrome-extension|Cannot access contents of|No tab with id|Debugger is not attached|Another debugger|Target closed/i.test(msg);
-    if (!transient) throw error;
-    await sleep(180);
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab || (tab.url || "").startsWith("chrome://") || (tab.url || "").startsWith("chrome-extension://")) {
-      throw new Error(`Chrome can't attach the debugger to this tab (${tab?.url ?? "unknown"}). Open a normal http(s) tab and try again.`);
+    const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || [])));
+    for (const tgt of targets) {
+      if (tgt.tabId === tabId && tgt.attached) {
+        recordAttachEvent({ kind: "stale-target-found", tabId, target: { id: tgt.id, type: tgt.type, url: tgt.url, extensionId: tgt.extensionId } });
+        try { await chrome.debugger.detach({ tabId }); } catch {}
+        await sleep(80);
+        break;
+      }
     }
-    await chrome.debugger.attach({ tabId }, CDP_VERSION);
+  } catch {}
+  const attemptAttach = async () => {
+    try {
+      await chrome.debugger.attach({ tabId }, CDP_VERSION);
+      return null;
+    } catch (error) {
+      return error;
+    }
+  };
+  let err = await attemptAttach();
+  if (err) {
+    const msg = String(err?.message || err);
+    const transient = /Cannot access a chrome-extension|Cannot access contents of|No tab with id|Debugger is not attached|Another debugger|Target closed/i.test(msg);
+    const tabSnapshot = await chrome.tabs.get(tabId).catch(() => null);
+    recordAttachEvent({ kind: "attach-failed", tabId, message: msg, tabUrl: tabSnapshot?.url, transient });
+    if (!transient) throw err;
+    if (!tabSnapshot || (tabSnapshot.url || "").startsWith("chrome://") || (tabSnapshot.url || "").startsWith("chrome-extension://")) {
+      throw new Error(`Chrome can't attach the debugger to this tab (${tabSnapshot?.url ?? "unknown"}). Open a normal http(s) tab and try again.`);
+    }
+    await sleep(180);
+    err = await attemptAttach();
+    if (err) {
+      recordAttachEvent({ kind: "attach-retry-failed", tabId, message: String(err.message || err), tabUrl: tabSnapshot?.url });
+      // One more try after a longer settle. Some Chrome builds need ~500ms after a navigation
+      // for content-script registration on the tab to drain before chrome.debugger.attach
+      // will accept the target.
+      await sleep(500);
+      err = await attemptAttach();
+      if (err) {
+        recordAttachEvent({ kind: "attach-retry2-failed", tabId, message: String(err.message || err), tabUrl: tabSnapshot?.url });
+        throw err;
+      }
+    }
   }
+  recordAttachEvent({ kind: "attached", tabId });
   // Seed pointer in a plausible "just left the address bar" location.
   const entry = { detachAt: Date.now() + TRUSTED_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } };
   attachedTabs.set(tabId, entry);
   return entry;
+}
+
+async function trustedDebug(params) {
+  const tab = params?.targetId ? await chrome.tabs.get(Number(params.targetId)).catch(() => null) : null;
+  let targets = [];
+  try { targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))); } catch {}
+  return {
+    extensionVersion: chrome.runtime.getManifest().version,
+    extensionId: chrome.runtime.id,
+    trustedMode: TRUSTED_MODE,
+    attachedTabs: Array.from(attachedTabs.keys()),
+    requestedTab: tab ? { id: tab.id, url: tab.url, status: tab.status, title: tab.title } : null,
+    cdpTargets: targets,
+    recentAttachEvents: attachDebugLog.slice(),
+  };
 }
 
 async function detachDebugger(tabId) {
@@ -639,6 +693,8 @@ async function dispatch(action, params) {
       return setTrustedMode(params.mode);
     case "trusted.status":
       return trustedStatus();
+    case "trusted.debug":
+      return trustedDebug(params);
     case "page.console.list":
       return executeInTab(params, listConsoleMessages, [params.clear === true]);
     case "page.network.list":
