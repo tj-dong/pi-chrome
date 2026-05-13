@@ -1,12 +1,12 @@
 const BRIDGE_URL = "http://127.0.0.1:17318";
-const CLIENT_NAME = `Pi Chrome Bridge ${chrome.runtime.id}`;
+const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 let polling = false;
 
 // =================== Trusted-input (CDP) layer ===================
 // Tracks which tabs we have attached chrome.debugger to, plus session-level mode.
 const attachedTabs = new Map(); // tabId -> { detachAt: number, pointer: {x,y} }
-let TRUSTED_MODE = "off"; // "off" | "on" | "auto"
+let TRUSTED_MODE = "auto"; // "off" | "on" | "auto" (default: smart retry only)
 const TRUSTED_IDLE_DETACH_MS = 15_000;
 const CDP_VERSION = "1.3";
 
@@ -33,6 +33,31 @@ function trustedStatus() {
     attachedTabs: Array.from(attachedTabs.keys()),
     permissionGranted: typeof chrome !== "undefined" && !!chrome.debugger,
   };
+}
+
+// Auto-upgrade: if synthetic result carries suggestTrusted=true, the bridge mode is "auto"
+// (default) or "on", and the caller didn't explicitly opt out, retry once with trusted CDP
+// path. Surfaces both results so callers can see what happened.
+async function maybeUpgradeToTrusted(kind, params, syntheticResult, trustedFn) {
+  if (!syntheticResult || !syntheticResult.suggestTrusted) return syntheticResult;
+  if (params && params.trusted === false) return syntheticResult;
+  if (TRUSTED_MODE === "off") return syntheticResult;
+  if (!chrome.debugger) return syntheticResult;
+  try {
+    const trustedResult = await trustedFn();
+    return {
+      ...trustedResult,
+      autoRetried: true,
+      autoRetryReason: syntheticResult.suggestReason || `${kind} produced no mutation`,
+      syntheticAttempt: { pageMutated: syntheticResult.pageMutated, suggestReason: syntheticResult.suggestReason },
+    };
+  } catch (error) {
+    return {
+      ...syntheticResult,
+      autoRetryAttempted: true,
+      autoRetryError: error?.message || String(error),
+    };
+  }
 }
 
 async function attachDebugger(tabId) {
@@ -485,9 +510,11 @@ async function dispatch(action, params) {
       ]);
     case "page.evaluate":
       return evaluateInTab(params);
-    case "page.click":
+    case "page.click": {
       if (await wantsTrusted(params)) return trustedClick(params);
-      return executeActionInTab(params, clickPage, [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null]);
+      const synth = await executeActionInTab(params, clickPage, [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null]);
+      return await maybeUpgradeToTrusted("click", params, synth, () => trustedClick(params));
+    }
     case "page.hover":
       if (await wantsTrusted(params)) return trustedHover(params);
       return executeActionInTab(params, hoverPage, [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null]);
@@ -496,9 +523,11 @@ async function dispatch(action, params) {
       return executeActionInTab(params, dragPage, [params.fromUid ?? null, params.fromSelector ?? null, params.fromX ?? null, params.fromY ?? null, params.toUid ?? null, params.toSelector ?? null, params.toX ?? null, params.toY ?? null, params.steps ?? 12]);
     case "page.upload":
       return executeActionInTab(params, uploadFiles, [params.selector ?? null, params.uid ?? null, params.files || []]);
-    case "page.type":
+    case "page.type": {
       if (await wantsTrusted(params)) return trustedType(params);
-      return executeActionInTab(params, typeIntoPage, [params.selector ?? null, params.uid ?? null, params.text || "", Boolean(params.pressEnter)]);
+      const synth = await executeActionInTab(params, typeIntoPage, [params.selector ?? null, params.uid ?? null, params.text || "", Boolean(params.pressEnter)]);
+      return await maybeUpgradeToTrusted("type", params, synth, () => trustedType(params));
+    }
     case "page.fill":
       if (await wantsTrusted(params)) return trustedFill(params);
       return executeActionInTab(params, fillPage, [params.selector ?? null, params.uid ?? null, params.text || "", params.submit === true]);
@@ -1262,10 +1291,30 @@ async function clickPage(selector, uid, x, y) {
   // Heuristic: if the clicked thing looks like a media play affordance and the page has paused
   // audio/video, the synthetic click may not unlock autoplay. Surface a warning.
   let autoplayHint;
-  const label = (point.element.getAttribute("aria-label") || point.element.textContent || "").toLowerCase();
-  if (/^(play|start|begin|next|continue|unmute)/.test(label.trim())) {
+  const labelRaw = (point.element.getAttribute("aria-label") || point.element.textContent || "").trim();
+  const label = labelRaw.toLowerCase();
+  if (/^(play|start|begin|next|continue|unmute)/.test(label)) {
     const idleMedia = Array.from(document.querySelectorAll("audio,video")).some((m) => m.paused);
     if (idleMedia) autoplayHint = "This element looks like a media affordance and the page has paused media. Synthetic clicks do not satisfy user-activation gates; audio/video may not start.";
+  }
+  const pageMutated = pageHash() !== before;
+  // Smart-auto retry hint: only set when synthetic produced no observable change AND the
+  // element looks gated, OR the page just emitted a user-activation rejection. The dispatcher
+  // uses this to decide whether to retry with trusted mode.
+  let suggestTrusted = false;
+  let suggestReason;
+  if (!pageMutated) {
+    if (autoplayHint) { suggestTrusted = true; suggestReason = "play/media affordance + idle media"; }
+    else if (/copy(\s|$)|paste|share|download|fullscreen|sign in with|continue with|allow|enable/i.test(label)) {
+      suggestTrusted = true; suggestReason = `label '${labelRaw.slice(0, 40)}' looks gated`;
+    } else {
+      // Inspect recent console errors for activation-gate rejections.
+      const recent = (state.console || []).slice(-8);
+      const hit = recent.find((e) => /NotAllowedError|Document is not focused|requires transient activation|gesture is required/.test(
+        (e.args || []).map((a) => typeof a === "string" ? a : (a && a.message) || JSON.stringify(a)).join(" ")
+      ));
+      if (hit) { suggestTrusted = true; suggestReason = "recent console error indicates user-activation gate"; }
+    }
   }
   return {
     x: point.x,
@@ -1273,12 +1322,15 @@ async function clickPage(selector, uid, x, y) {
     selector,
     uid,
     tag: point.element.tagName,
+    label: labelRaw.slice(0, 80) || undefined,
     isTrusted: false,
     defaultPrevented,
     elementVisible: visible,
     occludedBy: occluded || undefined,
-    pageMutated: pageHash() !== before,
+    pageMutated,
     autoplayHint,
+    suggestTrusted: suggestTrusted || undefined,
+    suggestReason,
   };
 }
 
@@ -1526,15 +1578,27 @@ async function typeIntoPage(selector, uid, text, pressEnter) {
   const before = pageHash();
   let element = elementBySelectorOrUid(selector, uid) || document.activeElement;
   if (!element) throw new Error(selector || uid ? `No element for ${selector || uid}` : "No active element");
+  const initialValue = "value" in element ? element.value : (element.isContentEditable ? element.textContent : null);
   element.focus();
   if (!(element.isContentEditable || "value" in element)) throw new Error("Focused element is not text-editable");
   for (const ch of Array.from(text)) await typeCharacter(element, ch);
   if (pressEnter) pressKeyInPage("Enter");
+  const finalValue = "value" in element ? element.value : element.textContent;
+  const valueMatches = "value" in element ? element.value.includes(text) : (element.textContent || "").includes(text);
+  const pageMutated = pageHash() !== before;
+  // Smart-auto retry hint when typing didn't land at all (e.g., editor blocks synthetic input).
+  let suggestTrusted = false, suggestReason;
+  if (text.length > 0 && initialValue === finalValue) {
+    suggestTrusted = true;
+    suggestReason = "value did not change — editor likely rejects synthetic input";
+  }
   return {
     selector, uid, length: text.length, pressEnter,
     isTrusted: false,
-    valueMatches: "value" in element ? element.value.includes(text) : undefined,
-    pageMutated: pageHash() !== before,
+    valueMatches,
+    pageMutated,
+    suggestTrusted: suggestTrusted || undefined,
+    suggestReason,
   };
 }
 

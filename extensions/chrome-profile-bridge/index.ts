@@ -471,7 +471,7 @@ Usage rules:
 					lines.push(
 						`✗ EXTENSION VERSION MISMATCH: companion extension is v${version.extensionVersion}, but pi-chrome is v${PI_CHROME_VERSION}.`,
 						`  All chrome_* tools will run with the OLD extension code until this is fixed.`,
-						`  Fix: open chrome://extensions and click reload on "Pi Existing Chrome Profile Bridge".`,
+						`  Fix: open chrome://extensions and click reload on "Pi Chrome Connector".`,
 						`  (Future version drifts will self-heal: the extension now polls pi-chrome's expected version and reloads itself.)`,
 					);
 				} else {
@@ -518,7 +518,14 @@ Usage rules:
 						permissionGranted?: boolean;
 					};
 					if (status.permissionGranted) {
-						lines.push(`✓ Trusted-input mode available via chrome.debugger (current: ${status.mode ?? "off"}${status.attachedTabs && status.attachedTabs.length ? `; attached to tab ${status.attachedTabs.join(",")}` : ""}). Pass trusted=true on chrome_click/type/etc, or run /chrome-trusted on, to satisfy isTrusted + user-activation gates.`);
+						const attached = status.attachedTabs && status.attachedTabs.length ? `; attached to tab ${status.attachedTabs.join(",")}` : "";
+						const note =
+							status.mode === "auto"
+								? " — smart-retry enabled: synthetic input runs first; if a click/type produced no page change AND the target looks gated, the call is automatically re-run with trusted CDP (yellow debugger banner appears only for that retry)."
+								: status.mode === "on"
+									? " — every chrome_* call goes through CDP; the yellow debugger banner is visible while attached."
+									: " — synthetic events only; pass trusted=true on chrome_click/type/etc, or switch to auto/on with /chrome-trusted, when isTrusted or user-activation gates matter.";
+						lines.push(`✓ Trusted-input mode available via chrome.debugger (current: ${status.mode ?? "off"}${attached}).${note}`);
 					} else {
 						lines.push(`⚠ chrome.debugger API unavailable. The extension is missing the "debugger" permission — reload the extension in chrome://extensions and accept the new permission prompt.`);
 					}
@@ -560,7 +567,7 @@ Usage rules:
 
 			if (!status.permissionGranted) {
 				ctx.ui.notify(
-					"chrome.debugger API unavailable — the extension is missing the 'debugger' permission. Open chrome://extensions, reload 'Pi Existing Chrome Profile Bridge', and accept the new permission prompt.",
+					"chrome.debugger API unavailable — the extension is missing the 'debugger' permission. Open chrome://extensions, reload 'Pi Chrome Connector', and accept the new permission prompt.",
 					"warning",
 				);
 				return;
@@ -577,9 +584,9 @@ Usage rules:
 			if (!target) {
 				// Interactive picker. Show current mode + tradeoffs in each label.
 				const options = [
-					`on${current === "on" ? " (current)" : ""} — all chrome_* tools via CDP; yellow debugger banner appears`,
-					`off${current === "off" ? " (current)" : ""} — synthetic DOM events only (default)`,
-					`auto${current === "auto" ? " (current)" : ""} — CDP only when a tool passes trusted=true`,
+					`auto${current === "auto" ? " (current)" : ""} — default; synthetic first, retry with CDP only when a call looks gated`,
+					`off${current === "off" ? " (current)" : ""} — synthetic DOM events only; never auto-retry`,
+					`on${current === "on" ? " (current)" : ""} — every chrome_* call goes through CDP (yellow debugger banner permanently visible)`,
 					`status — print current mode and any attached tabs\u2026`,
 				];
 				const picked = await ctx.ui.select(
@@ -610,7 +617,7 @@ Usage rules:
 			if (target === "on" && current === "off") {
 				const ok = await ctx.ui.confirm(
 					"Turn on trusted-input mode?",
-					"All chrome_* tools will dispatch through chrome.debugger (CDP). Events will arrive as isTrusted=true and satisfy user-activation gates (clipboard, fullscreen, autoplay, file picker).\n\nChrome will pin a yellow 'Pi Existing Chrome Profile Bridge started debugging this browser' banner to the top of any debugged tab while attached. Clicking 'Cancel' on that banner detaches the debugger.",
+					"All chrome_* tools will dispatch through chrome.debugger (CDP). Events will arrive as isTrusted=true and satisfy user-activation gates (clipboard, fullscreen, autoplay, file picker).\n\nChrome will pin a yellow 'Pi Chrome Connector started debugging this browser' banner to the top of any debugged tab while attached. Clicking 'Cancel' on that banner detaches the debugger.",
 				);
 				if (!ok) {
 					ctx.ui.notify("Trusted-input mode unchanged.", "info");
@@ -835,7 +842,7 @@ Usage rules:
 		name: "chrome_click",
 		label: "Chrome Click",
 		description:
-			"Click a snapshot uid, CSS selector, or viewport coordinate in an existing Chrome tab through the companion extension. Defaults to synthetic DOM events (isTrusted=false). Pass trusted=true (or run /chrome-trusted on) to route through chrome.debugger so events arrive as browser-trusted and satisfy user-activation gates — Chrome shows a yellow 'started debugging' banner while attached. Pass includeSnapshot=true to return a fresh snapshot after the click.",
+			"Click a snapshot uid, CSS selector, or viewport coordinate. Default 'auto' mode runs synthetic DOM events first and silently retries with trusted CDP only when the click looks gated (no page change + affordance label matches play/copy/share/sign-in/etc, or a recent NotAllowedError). The yellow 'started debugging' banner appears only when the retry actually happens. Pass trusted=true to force CDP for this call (banner appears immediately). Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after the click.",
 		promptSnippet: "Click page elements in Chrome by snapshot uid, selector, or viewport coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector after taking a snapshot." })),
@@ -868,7 +875,7 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type text into an existing Chrome tab. Defaults to synthetic per-character keydown/beforeinput/input/keyup sequence. Pass trusted=true (or run /chrome-trusted on) to route through chrome.debugger so each keystroke is browser-trusted (isTrusted=true). Pass includeSnapshot=true to return a fresh snapshot after typing.",
+			"Focus an optional snapshot uid or CSS selector, then type text. Default 'auto' mode runs synthetic per-character keydown/beforeinput/input/keyup first; if the input value doesn't change at all (editor rejected synthetic input) the call is silently retried through chrome.debugger so each keystroke is browser-trusted (isTrusted=true). Pass trusted=true to force CDP for this call. Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after typing.",
 		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
 		parameters: Type.Object({
 			text: Type.String(),
