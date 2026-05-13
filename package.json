@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.14.7",
+	"version": "0.14.8",
 	"description": "The de-facto browser automation toolkit for Pi agents. Drive your existing logged-in Chrome — no re-login, no throwaway profile, no CDP. 20+ tools (click, type, navigate, screenshot, network capture, file upload, drag, scroll, touch) + honest result envelopes + a built-in benchmark suite.",
 	"keywords": [
 		"pi",
