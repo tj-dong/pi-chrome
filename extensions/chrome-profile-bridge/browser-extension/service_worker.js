@@ -236,18 +236,36 @@ async function trustedKey(params) {
   await attachDebugger(tab.id);
   const key = String(params.key || "");
   if (!key) throw new Error("trusted.key: missing key");
+  const mods = params.modifiers || {};
+  const modBits = cdpModifiersFor(mods);
+  // Press modifiers in standard order, then key, then release in reverse.
+  const modOrder = [];
+  if (mods.metaKey) modOrder.push({ key: "Meta", code: "MetaLeft", vk: 91 });
+  if (mods.ctrlKey) modOrder.push({ key: "Control", code: "ControlLeft", vk: 17 });
+  if (mods.altKey) modOrder.push({ key: "Alt", code: "AltLeft", vk: 18 });
+  if (mods.shiftKey) modOrder.push({ key: "Shift", code: "ShiftLeft", vk: 16 });
+  for (const m of modOrder) {
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: modBits });
+    await sleep(rng(6, 18));
+  }
   const info = cdpKeyInfo(key);
+  // When modifiers are active, browsers usually emit "rawKeyDown" (no text) so chords like Cmd+V don't insert the literal char.
+  const downType = modBits ? "rawKeyDown" : "keyDown";
   await cdp(tab.id, "Input.dispatchKeyEvent", {
-    type: "keyDown", key: info.key, code: info.code,
+    type: downType, key: info.key, code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, nativeVirtualKeyCode: info.windowsVirtualKeyCode,
-    text: info.text, unmodifiedText: info.text,
+    text: modBits ? "" : info.text, unmodifiedText: modBits ? "" : info.text, modifiers: modBits,
   });
   await sleep(rng(25, 90));
   await cdp(tab.id, "Input.dispatchKeyEvent", {
     type: "keyUp", key: info.key, code: info.code,
-    windowsVirtualKeyCode: info.windowsVirtualKeyCode,
+    windowsVirtualKeyCode: info.windowsVirtualKeyCode, modifiers: modBits,
   });
-  return { trusted: true, key: info.key };
+  for (const m of modOrder.reverse()) {
+    await sleep(rng(5, 18));
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: 0 });
+  }
+  return { trusted: true, key: info.key, modifiers: mods };
 }
 
 async function trustedType(params) {

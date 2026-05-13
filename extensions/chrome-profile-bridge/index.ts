@@ -882,6 +882,12 @@ Usage rules:
 		promptSnippet: "Press keys in Chrome through the companion extension.",
 		parameters: Type.Object({
 			key: Type.String(),
+			modifiers: Type.Optional(Type.Object({
+				shiftKey: Type.Optional(Type.Boolean()),
+				ctrlKey: Type.Optional(Type.Boolean()),
+				altKey: Type.Optional(Type.Boolean()),
+				metaKey: Type.Optional(Type.Boolean()),
+			}, { description: "Modifier keys to hold while pressing the key (chord). Only honoured for trusted-mode presses; synthetic path ignores." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the keypress." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
