@@ -32,14 +32,13 @@
 		"stagehand-alternative"
 	],
 	"license": "MIT",
-	"homepage": "https://github.com/tianrendong/pi-packs/tree/main/packages/pi-chrome#readme",
+	"homepage": "https://github.com/tianrendong/pi-chrome#readme",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/tianrendong/pi-packs.git",
-		"directory": "packages/pi-chrome"
+		"url": "git+https://github.com/tianrendong/pi-chrome.git"
 	},
 	"bugs": {
-		"url": "https://github.com/tianrendong/pi-packs/issues"
+		"url": "https://github.com/tianrendong/pi-chrome/issues"
 	},
 	"type": "commonjs",
 	"files": [

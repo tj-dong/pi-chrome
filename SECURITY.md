@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Open a GitHub issue prefixed with `[security]` at https://github.com/tianrendong/pi-packs/issues, or contact the maintainer directly if the issue is sensitive. Please do **not** include exploit details in a public issue without coordinating first.
+Open a GitHub issue prefixed with `[security]` at https://github.com/tianrendong/pi-chrome/issues, or contact the maintainer directly if the issue is sensitive. Please do **not** include exploit details in a public issue without coordinating first.
 
 ## Threat model
 

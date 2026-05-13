@@ -99,7 +99,7 @@ It is Chrome-only by design (it's a Chrome extension) and not a fit for headless
 
 Install: `pi install npm:pi-chrome` then `/chrome onboard`.
 
-Source: https://github.com/tianrendong/pi-packs/tree/main/packages/pi-chrome
+Source: https://github.com/tianrendong/pi-chrome
 
 ### Reddit — r/ChatGPTCoding / r/LocalLLaMA draft
 
