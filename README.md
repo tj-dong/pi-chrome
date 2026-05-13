@@ -222,16 +222,16 @@ If the loaded Chrome extension is older than `pi-chrome` on disk, `/chrome docto
 
 ## Architecture
 
-```
-  ┌──────────────────────┐                         ┌──────────────────────────┐
-  │  Pi agent (terminal) │  ─── http://127.0.0.1:17318 ─→  │ Chrome extension     │
-  │  chrome_* tools      │                         │ (your real profile)      │
-  └──────────┬───────────┘                         └─────────┬────────────────┘
-             │ same machine                                  │
-             ▼                                               ▼
-   Other Pi sessions                              Tabs you already have open
-   share the same bridge                          (signed in to GitHub,
-   automatically                                   Linear, Stripe, etc.)
+```text
+  +----------------------+                       +--------------------------+
+  |  Pi agent (terminal) |  -- 127.0.0.1:17318 ->|  Chrome extension        |
+  |  chrome_* tools      |                       |  (your real profile)     |
+  +-----------+----------+                       +-------------+------------+
+              |  same machine                                  |
+              v                                                v
+   Other Pi sessions                          Tabs you already have open
+   share the same bridge                      (signed in to GitHub,
+   automatically                               Linear, Stripe, etc.)
 ```
 
 Multiple Pi sessions (planner / worker / audit) can all drive the same Chrome at once. The first session opens the local bridge; later sessions detect it and pipe their commands through.
