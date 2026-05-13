@@ -509,7 +509,7 @@ Usage rules:
 				lines.push(`… Skipped MAIN-world capability checks because the loaded extension is stale.`);
 			}
 
-			// Trusted-input (chrome.debugger) probe.
+			// Real-input mode probe (plain English for the user).
 			if (extensionAlive && !versionMismatch) {
 				try {
 					const status = (await bridge.send("trusted.status", {}, 5_000)) as {
@@ -518,19 +518,20 @@ Usage rules:
 						permissionGranted?: boolean;
 					};
 					if (status.permissionGranted) {
-						const attached = status.attachedTabs && status.attachedTabs.length ? `; attached to tab ${status.attachedTabs.join(",")}` : "";
+						const banner = status.attachedTabs && status.attachedTabs.length ? ` (yellow banner up on ${status.attachedTabs.length} tab(s))` : "";
 						const note =
 							status.mode === "auto"
-								? " — smart-retry enabled: synthetic input runs first; if a click/type produced no page change AND the target looks gated, the call is automatically re-run with trusted CDP (yellow debugger banner appears only for that retry)."
+								? " Clicks/keys are quiet by default; if a site rejects a quiet click, pi-chrome retries it once with a real-looking click. Yellow 'pi-chrome is controlling Chrome' banner shows only when that retry happens."
 								: status.mode === "on"
-									? " — every chrome_* call goes through CDP; the yellow debugger banner is visible while attached."
-									: " — synthetic events only; pass trusted=true on chrome_click/type/etc, or switch to auto/on with /chrome-trusted, when isTrusted or user-activation gates matter.";
-						lines.push(`✓ Trusted-input mode available via chrome.debugger (current: ${status.mode ?? "off"}${attached}).${note}`);
+									? " Every click and keystroke uses a real-looking event. Yellow 'pi-chrome is controlling Chrome' banner stays up on every tab pi-chrome touches."
+									: " All clicks are quiet, no yellow banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Switch to /chrome-trusted auto if a site isn't responding.";
+						const label = status.mode === "auto" ? "auto (smart upgrade)" : status.mode === "on" ? "on (always real-looking)" : "off (always quiet)";
+						lines.push(`✓ Click mode: ${label}${banner}.${note}`);
 					} else {
-						lines.push(`⚠ chrome.debugger API unavailable. The extension is missing the "debugger" permission — reload the extension in chrome://extensions and accept the new permission prompt.`);
+						lines.push(`⚠ Can't send real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt.`);
 					}
 				} catch (error) {
-					lines.push(`⚠ trusted.status probe failed: ${(error as Error).message}`);
+					lines.push(`⚠ Couldn't check click mode: ${(error as Error).message}`);
 				}
 			}
 
@@ -540,13 +541,13 @@ Usage rules:
 
 	pi.registerCommand("chrome-trusted", {
 		description:
-			"Toggle trusted-input mode for chrome_* tools. ON: all clicks/types/etc go through chrome.debugger (CDP) so events are browser-trusted (isTrusted=true) and satisfy user-activation gates (clipboard, fullscreen, autoplay, file picker). Tradeoff: Chrome pins a yellow 'started debugging this browser' banner to the top of any tab in use. OFF (default): synthetic DOM events. AUTO: attach on demand only when a per-call trusted=true is passed. STATUS: print current mode and attached tabs.",
+			"Choose how realistically pi-chrome should drive Chrome. Real-looking clicks/keys unlock things like copy-to-clipboard buttons, file pickers, and sign-in pages, but show a yellow 'pi-chrome is controlling Chrome' banner. Three modes:\n  auto (default) — quiet by default; auto-upgrade when a site blocks the quiet click.\n  off — always quiet, no banner; some sites won't accept these clicks.\n  on — always real-looking, banner stays up the whole session.\n  status — show the current mode.",
 		getArgumentCompletions: (prefix) => {
 			const items = [
-				{ value: "on", label: "on", description: "All chrome_* tools dispatch via CDP. Yellow debugger banner appears." },
-				{ value: "off", label: "off", description: "Synthetic events only (default)." },
-				{ value: "auto", label: "auto", description: "Use CDP only when a tool passes trusted=true." },
-				{ value: "status", label: "status", description: "Show current trusted mode and any attached tabs." },
+				{ value: "auto", label: "auto", description: "Default. Quiet clicks; upgrade to real ones only when a site rejects them." },
+				{ value: "off", label: "off", description: "Always quiet. No banner. Some sites won't accept the clicks." },
+				{ value: "on", label: "on", description: "Always real-looking clicks. Yellow banner stays up. Best for stubborn sites." },
+				{ value: "status", label: "status", description: "Show the current mode." },
 			];
 			const lowered = prefix.toLowerCase();
 			const matches = items.filter((item) => item.value.startsWith(lowered));
@@ -560,37 +561,43 @@ Usage rules:
 			try {
 				status = (await bridge.send("trusted.status", {}, 5_000)) as typeof status;
 			} catch (error) {
-				ctx.ui.notify(`Failed to read trusted mode: ${(error as Error).message}`, "warning");
+				ctx.ui.notify(`Couldn't check current mode: ${(error as Error).message}`, "warning");
 				return;
 			}
 			if (!status) return;
 
 			if (!status.permissionGranted) {
 				ctx.ui.notify(
-					"chrome.debugger API unavailable — the extension is missing the 'debugger' permission. Open chrome://extensions, reload 'Pi Chrome Connector', and accept the new permission prompt.",
+					"pi-chrome can't drive real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt that appears.",
 					"warning",
 				);
 				return;
 			}
 
-			const attached = status.attachedTabs?.length ? ` — currently attached to tab ${status.attachedTabs.join(",")}` : "";
+			const MODE_NAMES: Record<string, string> = {
+				auto: "auto (smart upgrade)",
+				off: "off (always quiet)",
+				on: "on (always real-looking)",
+			};
+			const friendly = (m: string) => MODE_NAMES[m] ?? m;
+			const attached = status.attachedTabs?.length ? ` — yellow banner currently up on ${status.attachedTabs.length} tab(s)` : "";
 			const current = status.mode;
 
 			let target = rawArg;
 			if (target === "status") {
-				ctx.ui.notify(`Trusted-input mode: ${current}${attached}`, "info");
+				ctx.ui.notify(`Current mode: ${friendly(current)}${attached}`, "info");
 				return;
 			}
 			if (!target) {
-				// Interactive picker. Show current mode + tradeoffs in each label.
+				// Interactive picker. Plain-English descriptions; no jargon.
 				const options = [
-					`auto${current === "auto" ? " (current)" : ""} — default; synthetic first, retry with CDP only when a call looks gated`,
-					`off${current === "off" ? " (current)" : ""} — synthetic DOM events only; never auto-retry`,
-					`on${current === "on" ? " (current)" : ""} — every chrome_* call goes through CDP (yellow debugger banner permanently visible)`,
-					`status — print current mode and any attached tabs\u2026`,
+					`auto${current === "auto" ? " (current)" : ""} — quiet by default; if a site rejects a quiet click, retry it once with a real-looking click. Yellow banner appears only when needed. Recommended for everyday use.`,
+					`off${current === "off" ? " (current)" : ""} — always quiet. No yellow banner, ever. Fast and unobtrusive, but some sites (sign-in pages, copy-to-clipboard buttons, file pickers, paywalls) will silently ignore the click.`,
+					`on${current === "on" ? " (current)" : ""} — every click and keystroke uses a real-looking event. Yellow 'pi-chrome is controlling Chrome' banner stays at the top of every Chrome window the whole session. Best when working a stubborn site for a long stretch.`,
+					`status — just show me which mode is on right now.`,
 				];
 				const picked = await ctx.ui.select(
-					`Trusted-input mode (current: ${current}${attached})`,
+					`How realistic should pi-chrome's clicks be? (current: ${friendly(current)}${attached})`,
 					options,
 				);
 				if (!picked) return; // cancelled
@@ -598,29 +605,29 @@ Usage rules:
 				else if (picked.startsWith("off")) target = "off";
 				else if (picked.startsWith("auto")) target = "auto";
 				else if (picked.startsWith("status")) {
-					ctx.ui.notify(`Trusted-input mode: ${current}${attached}`, "info");
+					ctx.ui.notify(`Current mode: ${friendly(current)}${attached}`, "info");
 					return;
 				}
 			}
 
 			if (!["on", "off", "auto"].includes(target)) {
-				ctx.ui.notify(`Unknown argument '${rawArg}'. Use: on | off | auto | status, or run /chrome-trusted with no args for a picker.`, "warning");
+				ctx.ui.notify(`Unknown choice '${rawArg}'. Pick one of: auto | off | on | status, or just run /chrome-trusted with no argument.`, "warning");
 				return;
 			}
 
 			if (target === current) {
-				ctx.ui.notify(`Trusted-input mode already ${current}.`, "info");
+				ctx.ui.notify(`Already in ${friendly(current)} mode.`, "info");
 				return;
 			}
 
-			// Extra confirmation only on first-time "on" (warn about banner).
-			if (target === "on" && current === "off") {
+			// Extra confirmation only on first-time "on" (warn about persistent banner).
+			if (target === "on" && current !== "on") {
 				const ok = await ctx.ui.confirm(
-					"Turn on trusted-input mode?",
-					"All chrome_* tools will dispatch through chrome.debugger (CDP). Events will arrive as isTrusted=true and satisfy user-activation gates (clipboard, fullscreen, autoplay, file picker).\n\nChrome will pin a yellow 'Pi Chrome Connector started debugging this browser' banner to the top of any debugged tab while attached. Clicking 'Cancel' on that banner detaches the debugger.",
+					"Always use real-looking clicks?",
+					"Every click and keystroke pi-chrome sends will now look like a real human action to websites. This unlocks copy-to-clipboard buttons, sign-in pages, file pickers, fullscreen, autoplay, and most bot-protected sites.\n\nThe tradeoff: Chrome will pin a yellow bar at the top of every Chrome window saying 'pi-chrome is controlling Chrome'. The bar stays visible for the rest of your pi session (or until you switch back to auto/off). Clicking 'Cancel' on the bar interrupts pi-chrome.",
 				);
 				if (!ok) {
-					ctx.ui.notify("Trusted-input mode unchanged.", "info");
+					ctx.ui.notify("Mode unchanged.", "info");
 					return;
 				}
 			}
@@ -629,16 +636,16 @@ Usage rules:
 				const result = (await bridge.send("trusted.mode", { mode: target }, 5_000)) as { mode: string };
 				if (result.mode === "on") {
 					ctx.ui.notify(
-						"Trusted-input mode ON. chrome_* tools now dispatch through chrome.debugger. The yellow debugger banner will appear when Chrome is next driven.",
+						"On. Every click and keystroke now looks real to websites. The yellow 'pi-chrome is controlling Chrome' banner will appear on every tab pi-chrome touches.",
 						"info",
 					);
 				} else if (result.mode === "off") {
-					ctx.ui.notify("Trusted-input mode OFF. Synthetic events only. Any attached debugger sessions detached.", "info");
+					ctx.ui.notify("Off. All clicks are quiet now, no yellow banner. Note: some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.", "info");
 				} else {
-					ctx.ui.notify("Trusted-input mode AUTO. CDP attaches only when a tool passes trusted=true.", "info");
+					ctx.ui.notify("Auto. Clicks stay quiet by default; pi-chrome will only switch to real-looking clicks when a site rejects a quiet one. The yellow banner will appear only when that retry happens.", "info");
 				}
 			} catch (error) {
-				ctx.ui.notify(`Failed to set trusted mode: ${(error as Error).message}`, "warning");
+				ctx.ui.notify(`Couldn't switch mode: ${(error as Error).message}`, "warning");
 			}
 		},
 	});

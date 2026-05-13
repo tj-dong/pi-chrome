@@ -169,7 +169,7 @@ async function cdpMoveTo(tabId, x, y) {
   const entry = attachedTabs.get(tabId);
   const startX = entry?.pointer?.x ?? Math.max(20, Math.min(400, x - 200));
   const startY = entry?.pointer?.y ?? Math.max(20, Math.min(400, y - 200));
-  const n = Math.max(10, Math.min(36, Math.round(Math.hypot(x - startX, y - startY) / 20)));
+  const n = Math.max(18, Math.min(42, Math.round(Math.hypot(x - startX, y - startY) / 18)));
   for (let i = 1; i <= n; i++) {
     const t = i / n;
     const ease = t * t * (3 - 2 * t);
@@ -368,13 +368,13 @@ async function trustedScroll(params) {
   const y = resolved.rect ? resolved.rect.top + Math.min(resolved.rect.height, 600) / 2 : resolved.y;
   const totalY = params.deltaY || 0, totalX = params.deltaX || 0;
   // Per-event delta cap so IntersectionObserver / scroll-driven animations get gradient samples.
-  // A real wheel notch is ~50-120px; we aim for the lower end so visibility transitions are visible.
-  const MAX_STEP = 60;
+  // A trackpad inertia tick often delivers ~10-30px per frame; using ~25px keeps small-target
+  // visibility transitions detectable while not making large scrolls take forever.
+  const MAX_STEP = 25;
   const peak = Math.max(Math.abs(totalY), Math.abs(totalX));
-  // We weight events with mild front-loading. The peak weight = 1.5 / n (vs uniform 1/n), so the
-  // first event is ~1.5× average. Choose n so even the peak event stays under MAX_STEP.
+  // Front-loaded weights peak at ~1.5× average, so choose n so peak event stays under MAX_STEP.
   const minN = Math.ceil(peak * 1.5 / MAX_STEP);
-  const n = Math.max(6, Math.min(80, params.steps || Math.max(minN, 12)));
+  const n = Math.max(6, Math.min(200, params.steps || Math.max(minN, 12)));
   // Front-loaded but smooth weights: w[i] = 1 + 0.5 * (1 - i/(n-1)) so the first event has
   // weight 1.5, the last has 1.0, average ~1.25; redistribution stays predictable.
   const w = [];
