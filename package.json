@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.12.1",
+	"version": "0.13.0",
 	"description": "Drive your existing logged-in Chrome from Pi — no re-login, no throwaway profile, watch the agent work in real time (or toggle quiet background mode).",
 	"keywords": [
 		"pi-package",

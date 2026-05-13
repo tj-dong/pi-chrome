@@ -440,7 +440,7 @@ Usage rules:
 2. \`includeSnapshot=true\` on click/type/fill to verify in one round trip.
 3. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
 4. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
-5. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome settings background to silence the whole session.
+5. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome quiet to silence the whole session.
 6. If you hit an autoplay/clipboard/file-picker gate, tell the user; this bridge cannot satisfy it.
 7. Run /chrome doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
@@ -523,7 +523,7 @@ Usage rules:
 								? " Clicks/keys are quiet by default; if a site rejects a quiet click, pi-chrome retries it once with a real-looking click. The Chrome banner shows only when that retry happens."
 								: status.mode === "on"
 									? " Every click and keystroke uses a real-looking event. The Chrome banner stays up on every tab pi-chrome touches."
-									: " All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Switch to /chrome settings trusted auto if a site isn’t responding.";
+									: " All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Run /chrome clicks if a site isn’t responding.";
 						const label = status.mode === "auto" ? "auto (smart upgrade)" : status.mode === "on" ? "on (always real-looking)" : "off (always quiet)";
 						lines.push(`✓ Click mode: ${label}${banner}.${note}`);
 					} else {
@@ -537,113 +537,98 @@ Usage rules:
 		ctx.ui.notify(lines.join("\n"), "info");
 	};
 
+	// Click realism handler. With no args, cycles auto → on → off → auto. Explicit args jump
+	// directly. 'status' prints the current mode without changing it.
+	const CLICKS_CYCLE = ["auto", "on", "off"] as const;
+	const CLICKS_DESC: Record<string, string> = {
+		auto: "Quiet by default; pi-chrome retries once with a real-looking click if a site rejects the quiet one. The Chrome banner appears only when that retry happens.",
+		off: "All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.",
+		on: "Every click and keystroke looks real to websites. Chrome shows a 'Pi Chrome Connector started debugging this browser' banner on every tab pi-chrome touches.",
+	};
+	const CLICKS_LABEL: Record<string, string> = {
+		auto: "auto (smart upgrade)",
+		off: "off (always quiet)",
+		on: "on (always real-looking)",
+	};
+
 	const trustedHandler = async (ctx: ExtensionContext, args: string) => {
-			const rawArg = (args || "").trim().toLowerCase();
+		const rawArg = (args || "").trim().toLowerCase();
 
-			// Resolve current status once for both branches (interactive picker + direct args).
-			let status: { mode: string; attachedTabs: number[]; permissionGranted: boolean } | undefined;
-			try {
-				status = (await bridge.send("trusted.status", {}, 5_000)) as typeof status;
-			} catch (error) {
-				ctx.ui.notify(`Couldn't check current mode: ${(error as Error).message}`, "warning");
-				return;
-			}
-			if (!status) return;
-
-			if (!status.permissionGranted) {
-				ctx.ui.notify(
-					"pi-chrome can't drive real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt that appears.",
-					"warning",
-				);
-				return;
-			}
-
-			const MODE_NAMES: Record<string, string> = {
-				auto: "auto (smart upgrade)",
-				off: "off (always quiet)",
-				on: "on (always real-looking)",
-			};
-			const friendly = (m: string) => MODE_NAMES[m] ?? m;
-			const attached = status.attachedTabs?.length ? ` — banner currently up on ${status.attachedTabs.length} tab(s)` : "";
-			const current = status.mode;
-
-			let target = rawArg;
-			if (target === "status") {
-				ctx.ui.notify(`Current mode: ${friendly(current)}${attached}`, "info");
-				return;
-			}
-			if (!target) {
-				// Interactive picker. Plain-English descriptions; no jargon.
-				const options = [
-					`auto${current === "auto" ? " (current)" : ""} — quiet by default; if a site rejects a quiet click, retry it once with a real-looking click. Yellow banner appears only when needed. Recommended for everyday use.`,
-					`off${current === "off" ? " (current)" : ""} — always quiet. No banner, ever. Fast and unobtrusive, but some sites (sign-in pages, copy-to-clipboard buttons, file pickers, paywalls) will silently ignore the click.`,
-					`on${current === "on" ? " (current)" : ""} — every click and keystroke uses a real-looking event. A banner stays at the top of every Chrome window for the whole session, saying ‘Pi Chrome Connector started debugging this browser’. Best when working a stubborn site for a long stretch.`,
-					`status — just show me which mode is on right now.`,
-				];
-				const picked = await ctx.ui.select(
-					`How realistic should pi-chrome's clicks be? (current: ${friendly(current)}${attached})`,
-					options,
-				);
-				if (!picked) return; // cancelled
-				if (picked.startsWith("on")) target = "on";
-				else if (picked.startsWith("off")) target = "off";
-				else if (picked.startsWith("auto")) target = "auto";
-				else if (picked.startsWith("status")) {
-					ctx.ui.notify(`Current mode: ${friendly(current)}${attached}`, "info");
-					return;
-				}
-			}
-
-			if (!["on", "off", "auto"].includes(target)) {
-				ctx.ui.notify(`Unknown choice '${rawArg}'. Pick one of: auto | off | on | status, or run /chrome settings trusted with no argument.`, "warning");
-				return;
-			}
-
-			if (target === current) {
-				ctx.ui.notify(`Already in ${friendly(current)} mode.`, "info");
-				return;
-			}
-
-			// Extra confirmation only on first-time "on" (warn about persistent banner).
-			if (target === "on" && current !== "on") {
-				const ok = await ctx.ui.confirm(
-					"Always use real-looking clicks?",
-					"Every click and keystroke pi-chrome sends will now look like a real human action to websites. This unlocks copy-to-clipboard buttons, sign-in pages, file pickers, fullscreen, autoplay, and most bot-protected sites.\n\nThe tradeoff: Chrome will pin a banner at the top of every Chrome window saying ‘Pi Chrome Connector started debugging this browser’. The banner stays visible for the rest of your pi session (or until you switch back to auto/off). Clicking ‘Cancel’ on the banner interrupts pi-chrome.",
-				);
-				if (!ok) {
-					ctx.ui.notify("Mode unchanged.", "info");
-					return;
-				}
-			}
-
-			try {
-				const result = (await bridge.send("trusted.mode", { mode: target }, 5_000)) as { mode: string };
-				if (result.mode === "on") {
-					ctx.ui.notify(
-						"On. Every click and keystroke now looks real to websites. A banner saying ‘Pi Chrome Connector started debugging this browser’ will appear on every tab pi-chrome touches.",
-						"info",
-					);
-				} else if (result.mode === "off") {
-				ctx.ui.notify("Off. All clicks are quiet now, no banner. Note: some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.", "info");
-				} else {
-					ctx.ui.notify("Auto. Clicks stay quiet by default; pi-chrome will only switch to real-looking clicks when a site rejects a quiet one. The Chrome banner will appear only when that retry happens.", "info");
-				}
-			} catch (error) {
-			ctx.ui.notify(`Couldn't switch mode: ${(error as Error).message}`, "warning");
+		let status: { mode: string; attachedTabs: number[]; permissionGranted: boolean } | undefined;
+		try {
+			status = (await bridge.send("trusted.status", {}, 5_000)) as typeof status;
+		} catch (error) {
+			ctx.ui.notify(`Couldn't check current click mode: ${(error as Error).message}`, "warning");
+			return;
 		}
+		if (!status) return;
+
+		if (!status.permissionGranted) {
+			ctx.ui.notify(
+				"pi-chrome can't drive real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt that appears.",
+				"warning",
+			);
+			return;
+		}
+
+		const current = status.mode;
+		const attached = status.attachedTabs?.length ? ` (banner up on ${status.attachedTabs.length} tab(s))` : "";
+
+		if (rawArg === "status") {
+			ctx.ui.notify(`Click mode is ${CLICKS_LABEL[current] ?? current}${attached}. ${CLICKS_DESC[current] ?? ""}`, "info");
+			return;
+		}
+
+		// No argument = cycle to the next mode.
+		let target = rawArg;
+		if (!target) {
+			const idx = CLICKS_CYCLE.indexOf(current as typeof CLICKS_CYCLE[number]);
+			target = CLICKS_CYCLE[(idx + 1 + CLICKS_CYCLE.length) % CLICKS_CYCLE.length];
+		}
+
+		if (!["on", "off", "auto"].includes(target)) {
+			ctx.ui.notify(`Unknown click mode '${rawArg}'. Pick one of: auto | off | on | status.`, "warning");
+			return;
+		}
+
+		if (target === current) {
+			ctx.ui.notify(`Click mode is already ${CLICKS_LABEL[current] ?? current}.`, "info");
+			return;
+		}
+
+		try {
+			await bridge.send("trusted.mode", { mode: target }, 5_000);
+			ctx.ui.notify(`Click mode → ${CLICKS_LABEL[target] ?? target}. ${CLICKS_DESC[target] ?? ""}`, "info");
+		} catch (error) {
+			ctx.ui.notify(`Couldn't switch click mode: ${(error as Error).message}`, "warning");
+		}
+	};
+
+	// Quiet (Chrome focus) handler. No args = toggle. Explicit on/off/status.
+	const QUIET_DESC: Record<string, string> = {
+		on: "pi-chrome works in the background; Chrome won't pop up or steal focus.",
+		off: "Chrome pops to the front and switches tabs so you can watch what pi-chrome is doing.",
 	};
 
 	const backgroundHandler = async (ctx: ExtensionContext, args: string) => {
 		const arg = (args || "").trim().toLowerCase();
+		const currentLabel = backgroundDefault ? "on" : "off";
+
+		if (arg === "status") {
+			ctx.ui.notify(`Quiet mode is ${currentLabel}. ${QUIET_DESC[currentLabel]}`, "info");
+			return;
+		}
+
 		if (arg === "on" || arg === "true" || arg === "1") backgroundDefault = true;
 		else if (arg === "off" || arg === "false" || arg === "0") backgroundDefault = false;
-		else backgroundDefault = !backgroundDefault;
-		ctx.ui.notify(
-			backgroundDefault
-				? "Quiet mode on. pi-chrome will work in the background; Chrome won't steal focus."
-				: "Watch mode on. Chrome will pop to the front and switch tabs so you can see what pi-chrome is doing.",
-			"info",
-		);
+		else if (arg === "toggle" || arg === "") backgroundDefault = !backgroundDefault;
+		else {
+			ctx.ui.notify(`Unknown quiet mode '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
+			return;
+		}
+
+		const nextLabel = backgroundDefault ? "on" : "off";
+		ctx.ui.notify(`Quiet mode → ${nextLabel}. ${QUIET_DESC[nextLabel]}`, "info");
 	};
 
 	const onboardHandler = async (ctx: ExtensionContext) => {
@@ -667,90 +652,131 @@ Usage rules:
 		);
 	};
 
-	const settingsHandler = async (ctx: ExtensionContext, rest: string[]) => {
-		if (rest.length === 0) {
-			const picked = await ctx.ui.select(
-				"pi-chrome settings — what would you like to change?",
-				[
-					"background — should Chrome pop to the front when pi-chrome acts, or work silently?",
-					"trusted — how realistic should pi-chrome's clicks and keystrokes be?",
-				],
-			);
-			if (!picked) return;
-			if (picked.startsWith("background")) return backgroundHandler(ctx, "");
-			if (picked.startsWith("trusted")) return trustedHandler(ctx, "");
-			return;
+	// One-line snapshot of pi-chrome's current state. Used as a header in the bare-/chrome
+	// picker and as the body of /chrome status.
+	const statusSummary = async (): Promise<string> => {
+		const parts: string[] = [];
+		try {
+			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string };
+			if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
+				parts.push(`⚠ Chrome extension v${version.extensionVersion} (pi-chrome v${PI_CHROME_VERSION}, reload extension)`);
+			} else {
+				parts.push(`✓ Chrome connected`);
+			}
+		} catch {
+			parts.push(`✗ Chrome not responding`);
 		}
-		const [head, ...sub] = rest;
-		const subArgs = sub.join(" ");
-		switch (head) {
-			case "background": return backgroundHandler(ctx, subArgs);
-			case "trusted": return trustedHandler(ctx, subArgs);
-			default:
-				ctx.ui.notify(`Unknown setting '${head}'. Try: /chrome settings background | trusted.`, "warning");
-		}
+		try {
+			const t = (await bridge.send("trusted.status", {}, 3_000)) as { mode?: string; attachedTabs?: number[] };
+			const banner = t.attachedTabs?.length ? `, banner on ${t.attachedTabs.length} tab(s)` : "";
+			parts.push(`clicks: ${t.mode ?? "?"}${banner}`);
+		} catch {}
+		parts.push(`quiet: ${backgroundDefault ? "on" : "off"}`);
+		return parts.join(" · ");
+	};
+
+	const statusHandler = async (ctx: ExtensionContext) => {
+		ctx.ui.notify(await statusSummary(), "info");
 	};
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place. Subcommands:\n  /chrome doctor — quick health check.\n  /chrome onboard — install the Chrome companion extension.\n  /chrome settings — change how pi-chrome behaves (background mode, click realism).\nRun with no arguments for an interactive picker.",
+			"All pi-chrome controls in one place.\n  /chrome status   — one-line snapshot of connection + current modes.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome clicks [auto|off|on|status]  — how realistic should pi-chrome's clicks be.\n  /chrome quiet  [on|off|status|toggle] — whether Chrome pops to the front when pi-chrome acts.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
-			const rawTokens = prefix.split(/\s+/);
-			const last = (rawTokens[rawTokens.length - 1] ?? "").toLowerCase();
-			const path = rawTokens.slice(0, -1).filter(Boolean).map((t) => t.toLowerCase());
+			const raw = prefix;
+			const trimmedRight = raw.replace(/\s+$/, "");
+			const tokens = trimmedRight ? trimmedRight.split(/\s+/) : [];
+			const endsWithSpace = raw.length > 0 && raw !== trimmedRight;
+			// Path = completed tokens; partial = the token currently being typed (or "" if cursor sits right after a space).
+			const partial = endsWithSpace ? "" : (tokens.pop() ?? "");
+			const path = tokens.map((t) => t.toLowerCase());
+			const partialLower = partial.toLowerCase();
 
-			const TOP = [
-				{ value: "doctor", description: "Quick health check. Tells you if Chrome is connected and what's wrong if it isn't." },
-				{ value: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
-				{ value: "settings", description: "Change pi-chrome behaviour: background mode, click realism." },
-			];
-			const SETTINGS = [
-				{ value: "background", description: "Should Chrome pop to the front when pi-chrome acts, or work silently?" },
-				{ value: "trusted", description: "How realistic should pi-chrome's clicks and keystrokes be?" },
-			];
-			const BG = [
-				{ value: "on", description: "Work silently. Chrome stays in the background. Your editor keeps focus." },
-				{ value: "off", description: "Bring Chrome to the front so you can watch (default)." },
-			];
-			const TRUSTED = [
-				{ value: "auto", description: "Default. Quiet clicks; upgrade to real ones only when a site rejects them." },
-				{ value: "off", description: "Always quiet. No banner. Some sites won't accept the clicks." },
-				{ value: "on", description: "Always real-looking clicks. Banner stays up. Best for stubborn sites." },
-				{ value: "status", description: "Show the current click mode." },
-			];
-
-			let pool: Array<{ value: string; description: string }> | null = null;
-			if (path.length === 0) pool = TOP;
-			else if (path[0] === "settings" && path.length === 1) pool = SETTINGS;
-			else if (path[0] === "settings" && path[1] === "background" && path.length === 2) pool = BG;
-			else if (path[0] === "settings" && path[1] === "trusted" && path.length === 2) pool = TRUSTED;
-			if (!pool) return null;
-
-			const items = pool.map((p) => ({ value: p.value, label: p.value, description: p.description }));
-			const filtered = items.filter((i) => i.value.startsWith(last));
-			return filtered.length > 0 ? filtered : null;
+			// Build candidate set with FULL argument-text values so pi-tui's apply-completion
+			// (which replaces the entire argument) lands correctly even for nested paths.
+			type Item = { fullValue: string; label: string; description: string };
+			let candidates: Item[] = [];
+			if (path.length === 0) {
+				candidates = [
+					{ fullValue: "status", label: "status", description: "One-line summary: connection + click mode + quiet mode." },
+					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
+					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
+					{ fullValue: "clicks", label: "clicks", description: "How realistic should pi-chrome's clicks be? auto / off / on." },
+					{ fullValue: "quiet", label: "quiet", description: "Should Chrome pop to the front when pi-chrome acts, or work silently?" },
+				];
+			} else if (path[0] === "clicks" && path.length === 1) {
+				candidates = [
+					{ fullValue: "clicks auto", label: "auto", description: "Default. Quiet clicks; upgrade to real-looking ones only when a site rejects them." },
+					{ fullValue: "clicks off", label: "off", description: "Always quiet. No banner. Some sites won't accept the clicks." },
+					{ fullValue: "clicks on", label: "on", description: "Always real-looking. Chrome shows a banner. Best for stubborn sites." },
+					{ fullValue: "clicks status", label: "status", description: "Show the current click mode." },
+				];
+			} else if (path[0] === "quiet" && path.length === 1) {
+				candidates = [
+					{ fullValue: "quiet on", label: "on", description: "Work silently. Chrome stays in the background. Your editor keeps focus." },
+					{ fullValue: "quiet off", label: "off", description: "Bring Chrome to the front so you can watch (default)." },
+					{ fullValue: "quiet toggle", label: "toggle", description: "Flip whichever way it's currently set." },
+					{ fullValue: "quiet status", label: "status", description: "Show the current setting." },
+				];
+			}
+			if (candidates.length === 0) return null;
+			const filtered = candidates.filter((c) => c.label.toLowerCase().startsWith(partialLower));
+			if (filtered.length === 0) return null;
+			return filtered.map((c) => ({ value: c.fullValue, label: c.label, description: c.description }));
 		},
 		handler: async (args, ctx) => {
 			const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0) {
-				const picked = await ctx.ui.select("pi-chrome — what would you like to do?", [
-					"doctor — quick health check; tells you what's wrong if Chrome isn't responding",
-					"onboard — install the Chrome companion extension (first-time setup)",
-					"settings — change pi-chrome behaviour (background mode, click realism)",
+				const header = await statusSummary();
+				// Compute next-cycle targets so the picker labels describe the toggle action.
+				let clicksNow = "?";
+				try {
+					const t = (await bridge.send("trusted.status", {}, 3_000)) as { mode?: string };
+					clicksNow = t.mode ?? "?";
+				} catch {}
+				const clicksNext = (() => {
+					const idx = CLICKS_CYCLE.indexOf(clicksNow as typeof CLICKS_CYCLE[number]);
+					return idx >= 0 ? CLICKS_CYCLE[(idx + 1) % CLICKS_CYCLE.length] : "auto";
+				})();
+				const quietNow = backgroundDefault ? "on" : "off";
+				const quietNext = backgroundDefault ? "off" : "on";
+				const picked = await ctx.ui.select(`pi-chrome — ${header}`, [
+					`status — print the line above (so you can copy it).`,
+					`doctor — full health check; explains anything broken.`,
+					`onboard — install the Chrome companion extension (first-time setup).`,
+					`clicks: ${clicksNow} → switch to ${clicksNext} — ${CLICKS_DESC[clicksNext] ?? ""}`,
+					`quiet: ${quietNow} → switch to ${quietNext} — ${QUIET_DESC[quietNext] ?? ""}`,
 				]);
 				if (!picked) return;
+				if (picked.startsWith("status")) return statusHandler(ctx);
 				if (picked.startsWith("doctor")) return doctorHandler(ctx);
 				if (picked.startsWith("onboard")) return onboardHandler(ctx);
-				if (picked.startsWith("settings")) return settingsHandler(ctx, []);
+				if (picked.startsWith("clicks")) return trustedHandler(ctx, ""); // cycles
+				if (picked.startsWith("quiet")) return backgroundHandler(ctx, ""); // toggles
 				return;
 			}
 			const [head, ...rest] = tokens;
+			const subArgs = rest.join(" ");
 			switch (head) {
+				case "status": return statusHandler(ctx);
 				case "doctor": return doctorHandler(ctx);
 				case "onboard": return onboardHandler(ctx);
-				case "settings": return settingsHandler(ctx, rest);
+				case "clicks":
+				case "trusted": // legacy alias
+					return trustedHandler(ctx, subArgs);
+				case "quiet":
+				case "background": // legacy alias
+					return backgroundHandler(ctx, subArgs);
+				case "settings": {
+					// Legacy nested form: /chrome settings background ... or /chrome settings trusted ...
+					const [setting, ...settingArgs] = rest;
+					if (setting === "background") return backgroundHandler(ctx, settingArgs.join(" "));
+					if (setting === "trusted") return trustedHandler(ctx, settingArgs.join(" "));
+					ctx.ui.notify(`'/chrome settings' was removed. Use /chrome clicks or /chrome quiet directly.`, "warning");
+					return;
+				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome doctor | onboard | settings.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome status | doctor | onboard | clicks | quiet.`, "warning");
 			}
 		},
 	});
