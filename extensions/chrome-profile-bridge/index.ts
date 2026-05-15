@@ -8,9 +8,8 @@ import { dirname, join, resolve } from "node:path";
 /**
  * Existing-profile Chrome bridge for pi.
  *
- * This is intentionally not a Chrome DevTools Protocol integration. CDP cannot attach to
- * already-running normal Chrome windows and recent Chrome builds block default-profile
- * remote debugging. Instead, install the companion Chrome extension from the
+ * This is intentionally not a remote-debugging-port integration. Chrome blocks default-profile
+ * remote debugging in many normal launches, so pi-chrome uses a companion extension from the
  * browser-extension folder bundled next to this Pi extension.
  *
  * The companion extension runs inside the user's real Chrome profile and polls this local
@@ -496,18 +495,18 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => {
 		const primer = `
 <chrome-profile-bridge>
-Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile, no CDP, no throwaway profile.
+Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile: no remote-debug port, no throwaway profile.
 
 Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via the **Function constructor**, which requires \`'unsafe-eval'\` in the page CSP. Pages with strict CSP (e.g. github.com, many bank/SaaS apps) will throw \`EvalError: ... 'unsafe-eval' is not an allowed source of script\` and chrome_snapshot will return empty. On those pages, drive the page with \`chrome_screenshot\` + viewport-coordinate \`chrome_click\`/\`chrome_type\`/\`chrome_key\`. \`chrome_navigate\`, \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input all keep working under any CSP.
-- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If an action result indicates no page change or occlusion, inspect current page state instead of repeating blindly.
+- Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
 1. If a chrome_* tool says Chrome control is locked, ask the user to run \`/chrome authorize\` before retrying.
 2. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
-3. \`includeSnapshot=true\` on click/type/fill to verify in one round trip.
+3. \`includeSnapshot=true\` on click/type/fill/key to verify in one round trip.
 4. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
 5. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
 6. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome background on for session-wide background execution.

@@ -1,7 +1,7 @@
 # pi-chrome
 
 > **The fastest way to give a [Pi](https://pi.dev) agent your real Chrome.**
-> No CDP. No throwaway profile. No re-login. Watch it work — or run silent.
+> No remote-debug port. No throwaway profile. No re-login. Watch it work — or run silent.
 
 **MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318`) · inspect [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading.** Verify connectivity in one command: `/chrome doctor`.
 
@@ -12,7 +12,7 @@ Agent:  chrome_tab(list) → chrome_snapshot(uid:…) → chrome_screenshot(...)
 You:    [keeps coding — agent never asked you to log in]
 ```
 
-`pi-chrome` ships **20+ browser tools** for Pi agents, backed by a small MIT-licensed Chrome extension that runs inside the Chrome profile **you already use** — including every site you're already signed into.
+`pi-chrome` ships **19 browser tools** for Pi agents, backed by a small MIT-licensed Chrome extension that runs inside the Chrome profile **you already use** — including every site you're already signed into.
 
 ---
 
@@ -30,7 +30,7 @@ Then in Pi:
 
 On macOS this opens `chrome://extensions`, reveals the bundled `browser-extension/` folder in Finder, and copies its path to your clipboard. In Chrome: **Developer mode** → **Load unpacked** → paste the path. Done.
 
-Verify, then authorize current Pi session in Pi:
+Verify, then authorize current Pi session from the terminal:
 
 ```text
 /chrome doctor
@@ -120,27 +120,23 @@ You:    [files the ticket with the folder attached]
 
 ---
 
-## Honest results
+## Verifiable actions
 
-Most browser-automation libraries return `void` or a generic ack. `pi-chrome` returns a structured envelope on every interaction:
-
-```text
-chrome_click(occluded-button) →
-  "Clicked el-3 — pageMutated=false; occluded by <div#overlay>"
-```
+Input tools return structured details such as the coordinates used, target tag, uploaded paths, key pressed, or scroll distance. For click/type/fill/key calls, pass `includeSnapshot: true` to get a fresh page snapshot in the same result:
 
 ```text
-chrome_type(react-input, "hello") →
-  "Typed into el-7 — valueMatches=true; pageMutated=true"
+chrome_click(uid:"el-3", includeSnapshot:true) →
+  result: { input:"chrome", x:412, y:238, tag:"BUTTON" }
+  snapshot: { title, url, text, elements:[...] }
 ```
 
-This is why agents using pi-chrome don't get stuck in retry loops on broken sites. They get the **reason** the action didn't land and can fix course in one turn.
+Agents can verify page state immediately instead of blindly retrying.
 
 ---
 
 ## What an agent gets
 
-**20 tools**, grouped by job. Every one runs against your already-open tabs.
+**19 tools**, grouped by job. Every one runs against your already-open tabs.
 
 | Category        | Tools                                                                                          |
 | --------------- | ---------------------------------------------------------------------------------------------- |

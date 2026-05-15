@@ -32,9 +32,9 @@ Chrome control is also locked per Pi session until you run `/chrome authorize`; 
 
 Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work.
 
-## Why can't this be on the Chrome Web Store?
+## Why ship as an unpacked extension?
 
-Web Store extensions cannot communicate with a local process bridge controlled by another tool — Google's policy. pi-chrome must ship as an unpacked extension you load yourself. The upside: you can read the source. The downside: each Chrome update may prompt you to re-confirm.
+pi-chrome ships as an unpacked extension so the source and broad browser permissions are easy to inspect and update with the npm package. The downside: you load it manually from `chrome://extensions` and reload it after package updates.
 
 ## What happens when I update pi-chrome?
 
@@ -42,8 +42,8 @@ Web Store extensions cannot communicate with a local process bridge controlled b
 
 ## What's the install footprint?
 
-- Pi side: one extension that registers ~20 tools and a few slash commands.
-- Chrome side: one unpacked extension, ~5000 LOC of plain JavaScript, no dependencies.
+- Pi side: one extension that registers 19 tools and a few slash commands.
+- Chrome side: one unpacked extension, ~2000 LOC of plain JavaScript, no dependencies.
 
 ## Can I script it without Pi?
 
@@ -53,18 +53,11 @@ The Pi-facing tools are thin wrappers around an HTTP bridge at `127.0.0.1:17318`
 
 Not always. `chrome_evaluate` and `chrome_snapshot` run in the page's MAIN world through the Function constructor, so pages whose CSP blocks `'unsafe-eval'` can reject them. `chrome_screenshot`, `chrome_navigate`, tab tools, and real Chrome input still work because they use extension/browser APIs rather than page JavaScript.
 
-## Why does my click return `pageMutated=false`?
+## How do I tell whether a click or type worked?
 
-Either:
-- The element was occluded (look for `occludedBy: <selector>` in the envelope).
-- The click handler called `event.preventDefault()` and the page intentionally ignored it.
-- The target changed after your snapshot; take a fresh snapshot or screenshot.
+Use `includeSnapshot=true` on `chrome_click`, `chrome_type`, `chrome_fill`, or `chrome_key`. The tool returns the Chrome-input result plus a fresh snapshot, so the agent can verify text, URL, visible elements, or form values before continuing.
 
-The result envelope tells you which one. **Don't blind-retry.**
-
-## Why does `chrome_type` return `valueMatches=false`?
-
-The field rejected or transformed the typed value. Common culprits: contenteditable rich-text editors, native date pickers, masked-input libraries, or masks. Try `chrome_fill`, then verify with `includeSnapshot=true`.
+If the page did not change, take a fresh snapshot or screenshot and check for overlays, disabled controls, stale element uids, or app-side validation.
 
 ## How do I attach a file to a React file input?
 

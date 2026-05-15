@@ -712,7 +712,7 @@ async function dispatch(action, params) {
     case "page.evaluate":
       return evaluateInTab(params);
     case "page.click":
-      return chromeInputClick(params);
+      return withOptionalSnapshot(params, chromeInputClick);
     case "page.hover":
       return chromeInputHover(params);
     case "page.drag":
@@ -720,11 +720,11 @@ async function dispatch(action, params) {
     case "page.upload":
       return chromeInputUpload(params);
     case "page.type":
-      return chromeInputType(params);
+      return withOptionalSnapshot(params, chromeInputType);
     case "page.fill":
-      return chromeInputFill(params);
+      return withOptionalSnapshot(params, chromeInputFill);
     case "page.key":
-      return chromeInputKey(params);
+      return withOptionalSnapshot(params, chromeInputKey);
     case "page.scroll":
       return chromeInputScroll(params);
     case "page.tap":
@@ -932,8 +932,8 @@ async function evaluateInTab(params) {
   return v;
 }
 
-async function executeActionInTab(params, func, args) {
-  const result = await executeInTab(params, func, args);
+async function withOptionalSnapshot(params, actionFn) {
+  const result = await actionFn(params);
   if (params.includeSnapshot) {
     const snapshot = await executeInTab({ ...params, foreground: false }, snapshotPage, [params.maxElements || 80, null, null, null]);
     return { result, snapshot };

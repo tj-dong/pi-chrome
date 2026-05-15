@@ -119,10 +119,8 @@ On my staging app:
 ### React controlled inputs
 
 ```text
-chrome_fill (not chrome_type) for React inputs — it uses the
-framework-aware native value setter so the form's state actually updates.
-After each fill, the result envelope's valueMatches=true confirms the
-component re-rendered with the new value.
+Use `chrome_fill` for React inputs when you want to replace the full value.
+Pass `includeSnapshot=true` to verify the component re-rendered with the new value.
 ```
 
 ### File upload without the native picker
@@ -160,7 +158,7 @@ Interactive tools use Chrome's real input layer by default: clicks, typing, fill
 - sign-in flows
 - guarded buttons
 - audio/video controls
-- fullscreen / permission prompts
+- fullscreen and other user-activation checks
 - pages with strict CSP or user-activation checks
 
 Chrome may show its debugger banner while pi-chrome is attached.

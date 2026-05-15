@@ -52,7 +52,7 @@ We benchmark in public — see [`../test-suite/`](../test-suite). Where exact sc
 1. **Profile attach, not driver launch.** Every other driver fights cookie persistence, login walls, MFA, and extension state. pi-chrome inherits all of it because it *is* your Chrome.
 2. **Chrome input against your real profile.** Interactive tools use CDP input for reliability while still controlling the Chrome profile you already use.
 3. **Extension bridge transport.** No `--remote-debugging-port`, no throwaway Chromium. Survives Chrome auto-updates. Works alongside your normal Chrome usage.
-4. **Honest result envelopes.** Every action returns `pageMutated`, `defaultPrevented`, `elementVisible`, `occludedBy`, `valueMatches`. Competitors return `void` or generic acks; agents loop blindly on broken clicks.
+4. **Structured action results.** Input tools return target coordinates/tags and can include a fresh snapshot (`includeSnapshot`) so agents can verify state instead of blindly retrying.
 5. **Multi-session shared bridge.** Planner + worker + audit Pi sessions all drive the same Chrome concurrently.
 6. **Stable element uids.** `chrome_snapshot` returns deterministic uids you can pass to subsequent actions — similar to BrowserGym's `bid`, but built into the snapshot tool itself.
 
@@ -101,9 +101,9 @@ These wrap a driver with an LLM loop. They are **higher-level than pi-chrome** a
 
 `pi-chrome` exposes tools that any Pi agent can call. If you want to use it from outside Pi:
 
-1. The local bridge speaks HTTP JSON-RPC at `127.0.0.1:17318` (default). The API is internal but stable across patch versions.
+1. The local bridge speaks HTTP JSON over `127.0.0.1:17318` (default). The API is internal; use the Pi tool surface unless you are building an adapter.
 2. Tool surface mirrors Playwright closely (click/type/navigate/snapshot/screenshot/evaluate/wait_for) so adapter code is short.
-3. Honest envelopes (`pageMutated`, `valueMatches`, `occludedBy`) let agent harnesses skip retry/heal logic.
+3. `includeSnapshot` on input tools lets agent harnesses verify state after actions.
 
 If you want a first-class pi-chrome adapter for Browser Use / Stagehand / LangGraph, file an issue with your use case.
 

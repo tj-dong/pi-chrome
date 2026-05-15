@@ -5,8 +5,8 @@ Thanks for considering a contribution. pi-chrome aims to be the **de-facto brows
 ## Non-negotiables
 
 1. **No re-login.** Every change must keep working against the user's already-signed-in Chrome profile. Anything that requires a fresh profile or extra auth steps is out of scope.
-2. **Honest result envelopes.** Every action tool returns `pageMutated`, `defaultPrevented`, `elementVisible`, `occludedBy` (when relevant), `valueMatches` (for input). Agents need to know **why** something didn't take effect.
-3. **Quiet by default, trusted by opt-in.** Synthetic DOM events first. CDP/`chrome.debugger` only when explicitly requested (`trusted: true`) or when the smart-auto heuristic detects an obvious user-activation gate.
+2. **Verifiable action results.** Input tools must return structured details and support `includeSnapshot` where verification matters. Agents need enough evidence to avoid blind retries.
+3. **Chrome real input.** Interactive controls use Chrome's input layer through `chrome.debugger`; do not re-expose synthetic/untrusted input as public UX.
 4. **Benchmarks gate features.** Add a page in `test-suite/` that fails before your change and passes after. We accept PRs faster when there's a green/red verdict to point at.
 
 ## Local dev
@@ -25,7 +25,7 @@ python3 -m http.server 8765
 
 1. Register in `extensions/chrome-profile-bridge/index.ts` (the `register*Tool` calls near line 840+).
 2. Implement the handler in `extensions/chrome-profile-bridge/browser-extension/service_worker.js`.
-3. Return a `pageMutated` + relevant fields.
+3. Return structured details and support `includeSnapshot` for user-visible state changes when relevant.
 4. Add a benchmark page under `test-suite/challenges/` and a manifest entry.
 5. Update `README.md` "What an agent gets" table.
 6. Add a `CHANGELOG.md` entry.
