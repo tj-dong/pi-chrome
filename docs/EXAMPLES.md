@@ -1,6 +1,6 @@
 # pi-chrome examples
 
-Real, useful agent prompts. Drop any of these into Pi after running `/chrome onboard`. Each one uses Chrome tabs and accounts you already have.
+Real, useful agent prompts. Drop any of these into Pi after running `/chrome onboard`, then `/chrome authorize`. Each one uses Chrome tabs and accounts you already have.
 
 ## Daily workflow
 
@@ -129,14 +129,14 @@ component re-rendered with the new value.
 
 ```text
 chrome_upload_file paths=[./fixtures/avatar.png] selector="input[type=file]"
-# No native file picker opens. Works with React/Vue/Angular controlled inputs.
+# Uses Chrome file-input control. No native file picker opens.
 ```
 
 ### Drag-to-reorder lists
 
 ```text
 chrome_drag fromUid=row-3 toUid=row-1
-# Fires real HTML5 dragstart/dragover/drop with a shared DataTransfer.
+# Uses Chrome pointer drag through its input layer.
 ```
 
 ## Multi-session patterns
@@ -153,14 +153,14 @@ chrome_drag fromUid=row-3 toUid=row-1
 
 A third Pi session can run `chrome_snapshot` periodically in `background: true` mode and post summaries via `pi-qq` — handy for long-running flows.
 
-## When to prefer trusted clicks
+## Chrome input
 
-Pass `trusted: true` on `chrome_click` (or run `/chrome clicks on`) when:
+Interactive tools use Chrome's real input layer by default: clicks, typing, fill, keys, hover, drag, scroll, and touch. This is reliable for:
 
-- the click should open a file picker
-- the click should write to the clipboard or read it
-- the click should start an audio/video play
-- the click should request fullscreen / push permission
-- the page is wrapped in a strict user-activation guard (some paywalls / login flows)
+- sign-in flows
+- guarded buttons
+- audio/video controls
+- fullscreen / permission prompts
+- pages with strict CSP or user-activation checks
 
-Everything else is faster and quieter without it.
+Chrome may show its debugger banner while pi-chrome is attached.

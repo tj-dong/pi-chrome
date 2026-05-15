@@ -12,10 +12,6 @@ Agent:  chrome_tab(list) → chrome_snapshot(uid:…) → chrome_screenshot(...)
 You:    [keeps coding — agent never asked you to log in]
 ```
 
-[![npm version](https://img.shields.io/npm/v/pi-chrome.svg)](https://www.npmjs.com/package/pi-chrome)
-[![npm downloads](https://img.shields.io/npm/dm/pi-chrome.svg)](https://www.npmjs.com/package/pi-chrome)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-
 `pi-chrome` ships **20+ browser tools** for Pi agents, backed by a small MIT-licensed Chrome extension that runs inside the Chrome profile **you already use** — including every site you're already signed into.
 
 ---
@@ -34,10 +30,11 @@ Then in Pi:
 
 On macOS this opens `chrome://extensions`, reveals the bundled `browser-extension/` folder in Finder, and copies its path to your clipboard. In Chrome: **Developer mode** → **Load unpacked** → paste the path. Done.
 
-Verify:
+Verify, then authorize current Pi session in Pi:
 
 ```text
 /chrome doctor
+/chrome authorize
 ```
 
 ```text
@@ -81,7 +78,7 @@ You:    [pastes the list straight into Linear]
 You:    "Open my Linear current cycle and write a 5-bullet standup from it."
 Agent:  chrome_tab(activate, urlIncludes:"linear.app") → chrome_snapshot(uid:el-cycle) → chrome_evaluate(...)
         ✓ 5 in-progress, 2 blocked. Standup draft:
-          • Shipped: bridge auto-recover.   • In flight: trusted-mode retry path.
+          • Shipped: bridge auto-recover.   • In flight: input reliability path.
           • Blocked: vendor portal CSP (waiting on infra).
           • Next: benchmark v2.             • Risk: none today.
 You:    [drops it into #standup]
@@ -123,28 +120,6 @@ You:    [files the ticket with the folder attached]
 
 ---
 
-## Why pi-chrome vs. Playwright / CDP / Selenium
-
-> Short version: **pi-chrome is primitives — "Playwright for the Chrome you're already signed into."** Not an agent loop. Plug it under any agent framework (Browser Use, Stagehand, LangGraph) or call its tools directly from a Pi agent. See [docs/COMPARISON.md](./docs/COMPARISON.md) for the full three-axis landscape (drivers, agents, cloud providers).
-
-|                                | **pi-chrome**                     | Playwright / Puppeteer        | CDP-based agents              | Selenium / WebDriver          |
-| ------------------------------ | --------------------------------- | ----------------------------- | ----------------------------- | ----------------------------- |
-| **Time from `pi install` → first useful action on your real account** | ~60s (load unpacked, `/chrome doctor`) | hours (script login, store creds, debug headless) | 30+ min (`--remote-debug` setup, attach) | hours (driver + login script) |
-| **Survives MFA / SSO without code** | ✅ already logged in              | ❌                             | ⚠️ if you re-auth             | ❌                             |
-| Uses your real signed-in Chrome | ✅ extension in your profile      | ❌ throwaway profile           | ⚠️ requires `--remote-debug`  | ❌ throwaway profile           |
-| Re-login required               | **Never**                         | Every run                     | Sometimes                     | Every run                     |
-| **Multiple agents drive the same Chrome at once** | ✅ shared bridge | ❌ port collisions             | ❌                             | ❌                             |
-| Watch agent work, live          | ✅ default; toggle quiet          | ❌ headless or new window      | ⚠️ debugger banner always     | ❌ new window                  |
-| Real browser-trusted clicks     | ✅ opt-in (`chrome clicks on`)    | ✅                             | ✅                             | ✅                             |
-| Network/console capture         | ✅ built-in                       | ✅                             | ✅                             | ⚠️ via extensions             |
-| **Honest result envelopes¹**    | ✅                                 | ⚠️                            | ❌                             | ❌                             |
-| Self-graded by built-in benchmark² | ✅ 38 primitives + 4 long-horizon | n/a                          | n/a                           | n/a                           |
-
-¹ Every action returns `pageMutated`, `defaultPrevented`, `elementVisible`, `occludedBy`, and `valueMatches` so the agent knows when a click didn't take effect — instead of looping blindly.
-² [`test-suite/`](./test-suite) is mode-aware: a synthetic-events tool is *expected* to fail clipboard. If you build a competing tool, send a PR with your scores. We benchmark in public.
-
----
-
 ## Honest results
 
 Most browser-automation libraries return `void` or a generic ack. `pi-chrome` returns a structured envelope on every interaction:
@@ -173,47 +148,51 @@ This is why agents using pi-chrome don't get stuck in retry loops on broken site
 | **Inspect**     | `chrome_snapshot` (uids + selectors + text + viewport), `chrome_screenshot`, `chrome_evaluate` |
 | **Navigate**    | `chrome_navigate` (with optional `initScript` at `document_start`), `chrome_wait_for`          |
 | **Interact**    | `chrome_click`, `chrome_type`, `chrome_fill`, `chrome_key`, `chrome_hover`                     |
-| **Gesture**     | `chrome_drag` (HTML5 DataTransfer), `chrome_scroll` (wheel + momentum), `chrome_tap` (touch)   |
-| **Files**       | `chrome_upload_file` (no native picker; works with React/Vue/Angular file inputs)              |
+| **Gesture**     | `chrome_drag` (Chrome pointer drag), `chrome_scroll` (wheel + momentum), `chrome_tap` (touch)  |
+| **Files**       | `chrome_upload_file` (Chrome file-input control; no native picker)                             |
 | **Observe**     | `chrome_list_console_messages`, `chrome_list_network_requests`, `chrome_get_network_request` (with response body) |
 
-Each tool is documented inline in Pi — agents see the parameters and the gotchas (synthetic vs. trusted, autoplay gates, file picker limits) without trial-and-error.
+Each tool is documented inline in Pi — agents see the parameters and gotchas (Chrome input, CSP limits, file upload behavior) without trial-and-error.
 
 ---
 
-## Click & input modes
+## Click & input behavior
 
-`pi-chrome` can drive Chrome two ways:
+`pi-chrome` drives interactive controls through Chrome's real input layer: clicks, typing, fill, keys, hover, drag, scroll, and touch. Under the hood it uses `chrome.debugger` / CDP, so input satisfies normal user-activation gates. Chrome may show the *"Pi Chrome Connector started debugging this browser"* banner while attached.
 
-- **Quiet** — synthetic DOM events. Fast, no UI banners. Drives React/Vue/Angular state. Won't satisfy autoplay, clipboard, file picker, fullscreen, or user-activation gates.
-- **Trusted** — `chrome.debugger` / CDP under the hood. Indistinguishable from a person clicking. Shows Chrome's *"Pi Chrome Connector started debugging this browser"* banner while active.
+### Authorization
+
+Chrome control is locked by default. Before any agent can use `chrome_*` tools, explicitly authorize the current Pi session from the terminal with `/chrome authorize`.
 
 ```text
-/chrome clicks auto     # default: quiet, upgrade to trusted only when needed
-/chrome clicks off      # always quiet, never banner
-/chrome clicks on       # always trusted, banner stays up
-/chrome clicks status
+/chrome authorize          # default: authorize for 15 minutes
+/chrome authorize 30m      # authorize for 30 minutes
+/chrome authorize 45       # custom minutes
+/chrome authorize indefinite # authorize until revoked or Pi exits
+/chrome revoke             # lock again
+/chrome status             # shows connection + auth + background
 ```
 
-Per-call `trusted: true / false` on any input tool wins over the global mode.
+This protects your signed-in Chrome profile from accidental agent use. The loopback bridge also rejects browser-origin command requests so arbitrary web pages cannot call into `127.0.0.1:17318` through CORS.
 
-### Background / watch modes
+### Run in background / watch modes
 
 By default, every `chrome_*` call focuses Chrome and activates the target tab so you can **watch the agent work** — invaluable for demos, debugging, and first-time confidence.
 
 ```text
-/chrome quiet          # toggle for the whole session
-/chrome quiet on       # explicit
-/chrome quiet off      # explicit
+/chrome background          # toggle for the whole session
+/chrome background on       # run in background
+/chrome background off      # bring Chrome forward so you can watch
 ```
 
-Per-call `background: true` wins over the session toggle.
+Per-call `background: true` wins over the session setting.
 
 ### Diagnostics
 
 - `/chrome doctor` — single command: connectivity, extension version, bridge owner, version drift, MAIN-world helper injection, `chrome_evaluate("1+1") === 2`, fingerprint flags.
 - `/chrome onboard` — guided first-time setup.
-- `/chrome quiet status`, `/chrome clicks status` — current modes.
+- `/chrome status` — current connection, authorization, and background state.
+- `/chrome background status` — current watch/background setting.
 
 If the loaded Chrome extension is older than `pi-chrome` on disk, `/chrome doctor` tells you to reload it from `chrome://extensions`.
 
@@ -241,7 +220,7 @@ Multiple Pi sessions (planner / worker / audit) can all drive the same Chrome at
 
 [`test-suite/`](./test-suite) is a benchmark for **any** browser-control agent (not just pi-chrome). It includes **38 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks**.
 
-Scoring is **expected-outcome-by-mode**, not raw PASS count: each challenge has an expected verdict per mode (`synthetic`, `trusted`, `manual`) and a tool grades itself by whether its actual outcome matches the expected one. This avoids false equivalence between modes — a synthetic-events tool isn't supposed to satisfy a clipboard user-activation gate; matching that expectation is the pass.
+Scoring tracks expected outcomes per challenge rather than raw PASS count, so tools are judged against their declared browser-control capability.
 
 Each challenge exposes `window.__verdict` / `window.__reason` / `window.__events` and a manifest entry with expected results per mode.
 
@@ -250,7 +229,7 @@ cd test-suite && python3 -m http.server 8765
 # open http://127.0.0.1:8765/ in the Chrome window pi-chrome controls
 ```
 
-Categories: `trusted-input`, `pointer-humanization`, `keyboard`, `activation-gates`, `scroll`, `drag-drop`, `clipboard`, `native-controls`, `frameworks`, `editing`, `dom-complexity`, `frames`, `files`, `observability`, `fingerprint`, `agent-safety`.
+Categories: `real-input`, `pointer-humanization`, `keyboard`, `activation-gates`, `scroll`, `drag-drop`, `clipboard`, `native-controls`, `frameworks`, `editing`, `dom-complexity`, `frames`, `files`, `observability`, `fingerprint`, `agent-safety`.
 
 If you build a competing tool, please open a PR with your scores. We benchmark in public.
 
@@ -258,25 +237,13 @@ If you build a competing tool, please open a PR with your scores. We benchmark i
 
 ## Security model & why unpacked
 
-**Unpacked on purpose.** A Web Store extension cannot talk to a local bridge controlled by another tool on the same machine — so pi-chrome ships its bridge as an inspectable, MIT-licensed folder you load once with Developer Mode. Every line is yours to read in [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension). `/chrome doctor` reports the loaded extension version and warns when it drifts from your installed `pi-chrome`.
+**Unpacked on purpose.** pi-chrome ships as an inspectable, MIT-licensed extension folder you load once with Developer Mode, so the local bridge and browser permissions are easy to audit and update without a Web Store release cycle. Every line is yours to read in [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension). `/chrome doctor` reports the loaded extension version and warns when it drifts from your installed `pi-chrome`.
 
-The companion extension runs in the Chrome profile where you install it and has broad tab/scripting permissions. Only install it from a package source you trust.
+The companion extension runs in the Chrome profile where you install it and has broad tab/scripting permissions. Only install it from a package source you trust. Even after install, `chrome_*` tools stay locked until you run `/chrome authorize` in Pi. Use `/chrome revoke` to lock them again.
 
-The Pi side listens on `127.0.0.1:17318` by default. Override before starting Pi:
+The Pi side listens on `127.0.0.1:17318` and rejects browser-origin command requests; ordinary web pages cannot use CORS to drive the bridge. The bundled Chrome extension currently polls that default port, so custom bridge ports are not supported without editing the extension source and reloading it.
 
-```bash
-PI_CHROME_BRIDGE_PORT=17319 pi
-```
-
-There is no network exposure; the bridge binds to loopback only.
-
----
-
-## Composes with
-
-- **[pi-qq](https://www.npmjs.com/package/pi-qq)** — `/qq summarize what the active GitHub tab shows` without polluting the main transcript.
-- **[pi-bar](https://www.npmjs.com/package/pi-bar)** — when the agent scrapes large pages, watch the context-usage segment turn yellow → red as a signal to `/qq` for a recap.
-- **PR demo skills** — screenshots write to `.pi/chrome-screenshots/` so you can attach them to PR descriptions or demo bundles.
+There is no network exposure in the default configuration; the bridge binds to loopback only.
 
 ---
 
@@ -290,16 +257,6 @@ There is no network exposure; the bridge binds to loopback only.
 - Recorder mode that emits agent prompts from your own clicks
 
 If you want one of those next, open an issue.
-
----
-
-## Contributing
-
-PRs welcome. The bar:
-
-1. Add a benchmark page in `test-suite/` that fails before your change and passes after.
-2. Keep `chrome_*` tool results honest — surface `pageMutated`, `valueMatches`, `defaultPrevented`, etc.
-3. Don't break the "no re-login" guarantee. Anything that requires a fresh profile is out of scope.
 
 ---
 

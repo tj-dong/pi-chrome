@@ -1,6 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -114,7 +112,7 @@ function summarizeActionResult(result: unknown): string | undefined {
 		parts.push(`occluded by <${o.tag ?? "?"}${o.id ? "#" + o.id : ""}>`);
 	}
 	if (r.valueMatches === false) parts.push("input value did not stick");
-	if (r.autoplayHint) parts.push("autoplay-gated affordance — synthetic click may not start media");
+	if (r.autoplayHint) parts.push("autoplay-gated affordance");
 	return parts.length ? parts.join("; ") : undefined;
 }
 
@@ -127,12 +125,32 @@ function readRequestBody(request: IncomingMessage): Promise<string> {
 	});
 }
 
+function corsHeadersFor(request: IncomingMessage): Record<string, string> {
+	const origin = String(request.headers.origin ?? "");
+	if (!origin.startsWith("chrome-extension://")) return {};
+	return {
+		"access-control-allow-origin": origin,
+		"access-control-allow-methods": "GET,POST,OPTIONS",
+		"access-control-allow-headers": "content-type",
+		"access-control-expose-headers": "x-pi-chrome-version",
+		"vary": "origin",
+	};
+}
+
+function isBrowserOriginAllowed(request: IncomingMessage): boolean {
+	const origin = String(request.headers.origin ?? "");
+	if (origin) return origin.startsWith("chrome-extension://");
+	const secFetchSite = String(request.headers["sec-fetch-site"] ?? "");
+	return !secFetchSite || secFetchSite === "none" || secFetchSite === "same-origin";
+}
+
+function isLocalProcessRequest(request: IncomingMessage): boolean {
+	return !request.headers.origin && !request.headers["sec-fetch-site"];
+}
+
 function sendJson(response: ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
 	response.writeHead(status, {
 		"content-type": "application/json; charset=utf-8",
-		"access-control-allow-origin": "*",
-		"access-control-allow-methods": "GET,POST,OPTIONS",
-		"access-control-allow-headers": "content-type",
 		"cache-control": "no-store",
 		...(extraHeaders ?? {}),
 	});
@@ -159,7 +177,7 @@ class ChromeProfileBridge {
 
 	get connected(): boolean {
 		// MV3 service workers can pause between polls/alarms. Treat a recent poll as
-		// connected without sending a synthetic command; real chrome_* tool calls are
+		// connected without sending a probe command; real chrome_* tool calls are
 		// the authoritative end-to-end health check.
 		return this.lastSeenAt !== undefined && Date.now() - this.lastSeenAt < 5 * 60_000;
 	}
@@ -278,16 +296,25 @@ class ChromeProfileBridge {
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+		const url = new URL(request.url ?? "/", this.url);
+		const corsHeaders = corsHeadersFor(request);
 		if (request.method === "OPTIONS") {
-			sendJson(response, 200, { ok: true });
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
+			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
-		const url = new URL(request.url ?? "/", this.url);
 		if (request.method === "GET" && url.pathname === "/status") {
 			sendJson(response, 200, this.status());
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/command") {
+			if (!isLocalProcessRequest(request)) {
+				sendJson(response, 403, { ok: false, error: "Chrome commands are accepted only from local Pi processes" });
+				return;
+			}
 			const body = JSON.parse(await readRequestBody(request)) as {
 				action?: string;
 				params?: Record<string, unknown>;
@@ -306,6 +333,10 @@ class ChromeProfileBridge {
 			return;
 		}
 		if (request.method === "GET" && url.pathname === "/next") {
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
 			this.lastSeenAt = Date.now();
 			this.clientName = url.searchParams.get("name") ?? undefined;
 			let aborted = false;
@@ -334,23 +365,27 @@ class ChromeProfileBridge {
 				command
 					? { type: "command", command, expectedExtensionVersion: currentVersion }
 					: { type: "none", expectedExtensionVersion: currentVersion },
-				{ "x-pi-chrome-version": currentVersion },
+				{ ...corsHeaders, "x-pi-chrome-version": currentVersion },
 			);
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/result") {
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
 			this.lastSeenAt = Date.now();
 			const result = JSON.parse(await readRequestBody(request)) as BridgeResult;
 			const pending = this.pending.get(result.id);
 			if (!pending) {
-				sendJson(response, 404, { ok: false, error: "unknown command id" });
+				sendJson(response, 404, { ok: false, error: "unknown command id" }, corsHeaders);
 				return;
 			}
 			clearTimeout(pending.timer);
 			this.pending.delete(result.id);
 			if (result.ok) pending.resolve(result.result);
 			else pending.reject(new Error(result.error ?? "Chrome extension command failed"));
-			sendJson(response, 200, { ok: true });
+			sendJson(response, 200, { ok: true }, corsHeaders);
 			return;
 		}
 		sendJson(response, 404, { error: "not found" });
@@ -399,6 +434,34 @@ export default function (pi: ExtensionAPI): void {
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = false;
+	let chromeAuthorizedUntil: number | "indefinite" | undefined;
+
+	const authSummary = (): string => {
+		if (chromeAuthorizedUntil === "indefinite") return "authorized indefinitely";
+		if (typeof chromeAuthorizedUntil === "number") {
+			const remainingMs = chromeAuthorizedUntil - Date.now();
+			if (remainingMs > 0) return `authorized for ~${Math.ceil(remainingMs / 60_000)}m`;
+		}
+		return "locked";
+	};
+
+	const chromeControlAuthorized = (): boolean => {
+		if (chromeAuthorizedUntil === "indefinite") return true;
+		if (typeof chromeAuthorizedUntil === "number" && chromeAuthorizedUntil > Date.now()) return true;
+		chromeAuthorizedUntil = undefined;
+		return false;
+	};
+
+	const requireChromeControlAuthorized = (): void => {
+		if (!chromeControlAuthorized()) {
+			throw new Error("Chrome control locked. Ask the user to run /chrome authorize before using chrome_* tools.");
+		}
+	};
+
+	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> => {
+		requireChromeControlAuthorized();
+		return bridge.send(action, params, timeoutMs);
+	};
 
 	// Translate the public `background` parameter (default false = visible/foreground) into the
 	// service worker's wire-level `foreground` flag, accepting legacy `foreground` as a fallback.
@@ -420,8 +483,8 @@ export default function (pi: ExtensionAPI): void {
 		ctx.ui.setStatus("chrome", `Chrome bridge :${DEFAULT_PORT}`);
 		ctx.ui.notify(
 			status.mode === "client"
-				? `pi-chrome connected (sharing the Chrome connection an earlier pi session opened).`
-				: `pi-chrome is ready and waiting for the Chrome companion to connect. Run /chrome onboard to install it.`,
+				? `pi-chrome connected (sharing the Chrome connection an earlier pi session opened). Run /chrome authorize before using chrome_* tools.`
+				: `pi-chrome is ready and waiting for the Chrome companion to connect. Run /chrome onboard to install it, then /chrome authorize to allow chrome_* tools.`,
 			"info",
 		);
 	});
@@ -436,19 +499,20 @@ export default function (pi: ExtensionAPI): void {
 Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile, no CDP, no throwaway profile.
 
 Capability model (important):
-- Default input path is **synthetic DOM events** (\`isTrusted=false\`). Synthetic events drive React/Vue/Angular state fine, but they do NOT satisfy Chrome's user-activation gates: audio/video autoplay, clipboard write, file pickers, fullscreen, and Web Push prompts will NOT open from a synthetic chrome_click.
-- **Trusted escape hatch**: chrome_click / chrome_type / chrome_key / chrome_fill / chrome_hover / chrome_drag / chrome_scroll all accept \`trusted: true\`, which dispatches through chrome.debugger / CDP. Trusted events are browser-trusted (\`isTrusted=true\`) and **bypass page CSP entirely** because they're injected at the input layer, not via JS. Default mode is \`auto\`: synthetic first, silent CDP retry only when the click looks gated. If a synthetic click/type produced no \`pageMutated\` or you got a CSP/eval error from chrome_evaluate, escalate to \`trusted: true\` yourself — don't ask the user.
-- \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via the **Function constructor**, which requires \`'unsafe-eval'\` in the page CSP. Pages with strict CSP (e.g. github.com, many bank/SaaS apps) will throw \`EvalError: ... 'unsafe-eval' is not an allowed source of script\` and chrome_snapshot will return empty. On those pages, drive the page with \`chrome_screenshot\` (extension API, not gated by CSP) + \`chrome_click\`/\`chrome_type\`/\`chrome_key\` with \`trusted: true\` and viewport coordinates. \`chrome_navigate\`, \`chrome_screenshot\`, \`chrome_tab\`, and trusted input all keep working under any CSP.
-- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If \`pageMutated\` is false after a click that should have changed something, the click likely didn't take effect — do NOT just retry the same way; either escalate to \`trusted: true\` or check the snapshot for occlusion.
+- Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
+- Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
+- \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via the **Function constructor**, which requires \`'unsafe-eval'\` in the page CSP. Pages with strict CSP (e.g. github.com, many bank/SaaS apps) will throw \`EvalError: ... 'unsafe-eval' is not an allowed source of script\` and chrome_snapshot will return empty. On those pages, drive the page with \`chrome_screenshot\` + viewport-coordinate \`chrome_click\`/\`chrome_type\`/\`chrome_key\`. \`chrome_navigate\`, \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input all keep working under any CSP.
+- Tool results include \`pageMutated\`, \`defaultPrevented\`, \`elementVisible\`, \`occludedBy\`, and (for type/fill) \`valueMatches\`. If an action result indicates no page change or occlusion, inspect current page state instead of repeating blindly.
 
 Usage rules:
-1. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
-2. \`includeSnapshot=true\` on click/type/fill to verify in one round trip.
-3. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
-4. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
-5. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome quiet to silence the whole session.
-6. If you hit an autoplay/clipboard/file-picker gate, tell the user; this bridge cannot satisfy it. (Generic clicks/typing/CSP gates are fine — escalate to \`trusted: true\`.)
-7. Run /chrome doctor when in doubt about connectivity or capabilities.
+1. If a chrome_* tool says Chrome control is locked, ask the user to run \`/chrome authorize\` before retrying.
+2. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
+3. \`includeSnapshot=true\` on click/type/fill to verify in one round trip.
+4. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
+5. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
+6. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome background on for session-wide background execution.
+7. If you hit a native file-picker or privileged browser prompt gate, tell the user; generic clicks/typing/CSP gates are handled by Chrome input.
+8. Run /chrome doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
 		return { systemPrompt: event.systemPrompt + primer };
 	});
@@ -514,105 +578,12 @@ Usage rules:
 				lines.push(`… Skipped the remaining checks until you reload the Chrome extension.`);
 			}
 
-			// Real-input mode probe (plain English for the user).
-			if (extensionAlive && !versionMismatch) {
-				try {
-					const status = (await bridge.send("trusted.status", {}, 5_000)) as {
-						mode?: string;
-						attachedTabs?: number[];
-						permissionGranted?: boolean;
-					};
-					if (status.permissionGranted) {
-						const banner = status.attachedTabs && status.attachedTabs.length ? ` (‘Pi Chrome Connector started debugging this browser’ banner up on ${status.attachedTabs.length} tab(s))` : "";
-						const note =
-							status.mode === "auto"
-								? " Clicks/keys are quiet by default; if a site rejects a quiet click, pi-chrome retries it once with a real-looking click. The Chrome banner shows only when that retry happens."
-								: status.mode === "on"
-									? " Every click and keystroke uses a real-looking event. The Chrome banner stays up on every tab pi-chrome touches."
-									: " All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore them. Run /chrome clicks if a site isn’t responding.";
-						const label = status.mode === "auto" ? "auto (smart upgrade)" : status.mode === "on" ? "on (always real-looking)" : "off (always quiet)";
-						lines.push(`✓ Click mode: ${label}${banner}.${note}`);
-					} else {
-						lines.push(`⚠ Can't send real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt.`);
-					}
-				} catch (error) {
-					lines.push(`⚠ Couldn't check click mode: ${(error as Error).message}`);
-				}
-			}
-
 		ctx.ui.notify(lines.join("\n"), "info");
 	};
 
-	// Click realism handler. With no args, cycles auto → on → off → auto. Explicit args jump
-	// directly. 'status' prints the current mode without changing it.
-	const CLICKS_CYCLE = ["auto", "on", "off"] as const;
-	const CLICKS_DESC: Record<string, string> = {
-		auto: "Quiet by default; pi-chrome retries once with a real-looking click if a site rejects the quiet one. The Chrome banner appears only when that retry happens.",
-		off: "All clicks are quiet, no banner. Some sites (sign-ins, copy buttons, file pickers, paywalls) may silently ignore these clicks.",
-		on: "Every click and keystroke looks real to websites. Chrome shows a 'Pi Chrome Connector started debugging this browser' banner on every tab pi-chrome touches.",
-	};
-	const CLICKS_LABEL: Record<string, string> = {
-		auto: "auto (smart upgrade)",
-		off: "off (always quiet)",
-		on: "on (always real-looking)",
-	};
-
-	const trustedHandler = async (ctx: ExtensionContext, args: string) => {
-		const rawArg = (args || "").trim().toLowerCase();
-
-		let status: { mode: string; attachedTabs: number[]; permissionGranted: boolean } | undefined;
-		try {
-			status = (await bridge.send("trusted.status", {}, 5_000)) as typeof status;
-		} catch (error) {
-			ctx.ui.notify(`Couldn't check current click mode: ${(error as Error).message}`, "warning");
-			return;
-		}
-		if (!status) return;
-
-		if (!status.permissionGranted) {
-			ctx.ui.notify(
-				"pi-chrome can't drive real-looking clicks yet — the companion extension is missing a permission. Open chrome://extensions, click reload on 'Pi Chrome Connector', and accept the new permission prompt that appears.",
-				"warning",
-			);
-			return;
-		}
-
-		const current = status.mode;
-		const attached = status.attachedTabs?.length ? ` (banner up on ${status.attachedTabs.length} tab(s))` : "";
-
-		if (rawArg === "status") {
-			ctx.ui.notify(`Click mode is ${CLICKS_LABEL[current] ?? current}${attached}. ${CLICKS_DESC[current] ?? ""}`, "info");
-			return;
-		}
-
-		// No argument = cycle to the next mode.
-		let target = rawArg;
-		if (!target) {
-			const idx = CLICKS_CYCLE.indexOf(current as typeof CLICKS_CYCLE[number]);
-			target = CLICKS_CYCLE[(idx + 1 + CLICKS_CYCLE.length) % CLICKS_CYCLE.length];
-		}
-
-		if (!["on", "off", "auto"].includes(target)) {
-			ctx.ui.notify(`Unknown click mode '${rawArg}'. Pick one of: auto | off | on | status.`, "warning");
-			return;
-		}
-
-		if (target === current) {
-			ctx.ui.notify(`Click mode is already ${CLICKS_LABEL[current] ?? current}.`, "info");
-			return;
-		}
-
-		try {
-			await bridge.send("trusted.mode", { mode: target }, 5_000);
-			ctx.ui.notify(`Click mode → ${CLICKS_LABEL[target] ?? target}. ${CLICKS_DESC[target] ?? ""}`, "info");
-		} catch (error) {
-			ctx.ui.notify(`Couldn't switch click mode: ${(error as Error).message}`, "warning");
-		}
-	};
-
-	// Quiet (Chrome focus) handler. No args = toggle. Explicit on/off/status.
-	const QUIET_DESC: Record<string, string> = {
-		on: "pi-chrome works in the background; Chrome won't pop up or steal focus.",
+	// Run-in-background (Chrome focus) handler. No args = toggle. Explicit on/off/status.
+	const BACKGROUND_DESC: Record<string, string> = {
+		on: "pi-chrome runs in the background; Chrome won't pop up or steal focus.",
 		off: "Chrome pops to the front and switches tabs so you can watch what pi-chrome is doing.",
 	};
 
@@ -621,7 +592,7 @@ Usage rules:
 		const currentLabel = backgroundDefault ? "on" : "off";
 
 		if (arg === "status") {
-			ctx.ui.notify(`Quiet mode is ${currentLabel}. ${QUIET_DESC[currentLabel]}`, "info");
+			ctx.ui.notify(`Run in background is ${currentLabel}. ${BACKGROUND_DESC[currentLabel]}`, "info");
 			return;
 		}
 
@@ -629,12 +600,47 @@ Usage rules:
 		else if (arg === "off" || arg === "false" || arg === "0") backgroundDefault = false;
 		else if (arg === "toggle" || arg === "") backgroundDefault = !backgroundDefault;
 		else {
-			ctx.ui.notify(`Unknown quiet mode '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
+			ctx.ui.notify(`Unknown background setting '${arg}'. Pick one of: on | off | toggle | status.`, "warning");
 			return;
 		}
 
 		const nextLabel = backgroundDefault ? "on" : "off";
-		ctx.ui.notify(`Quiet mode → ${nextLabel}. ${QUIET_DESC[nextLabel]}`, "info");
+		ctx.ui.notify(`Run in background → ${nextLabel}. ${BACKGROUND_DESC[nextLabel]}`, "info");
+	};
+
+	const authorizeFor = async (ctx: ExtensionContext, label: string, until: number | "indefinite") => {
+		const ok = await ctx.ui.confirm(
+			"Authorize pi-chrome control?",
+			`This Pi session will be allowed to inspect and control your existing Chrome profile for ${label}.\n\nChrome actions use your signed-in browser state and real input. Only approve if you trust the current agent/task.`,
+		);
+		if (!ok) {
+			ctx.ui.notify("Chrome control remains locked.", "info");
+			return;
+		}
+		chromeAuthorizedUntil = until;
+		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
+	};
+
+	const parseAuthorizeArg = (arg: string): { label: string; until: number | "indefinite" } | undefined => {
+		const normalized = arg.trim().toLowerCase() || "15m";
+		if (normalized === "indefinite" || normalized === "forever") return { label: "indefinitely", until: "indefinite" };
+		const minutes = normalized.endsWith("m") ? Number(normalized.slice(0, -1)) : Number(normalized);
+		if (!Number.isFinite(minutes) || minutes <= 0) return undefined;
+		return { label: `${minutes} minutes`, until: Date.now() + minutes * 60_000 };
+	};
+
+	const authorizeHandler = async (ctx: ExtensionContext, args: string) => {
+		const grant = parseAuthorizeArg(args);
+		if (!grant) {
+			ctx.ui.notify("Unknown authorize duration. Use minutes (15m, 30m, 45) or indefinite.", "warning");
+			return;
+		}
+		return authorizeFor(ctx, grant.label, grant.until);
+	};
+
+	const revokeHandler = (ctx: ExtensionContext) => {
+		chromeAuthorizedUntil = undefined;
+		ctx.ui.notify("Chrome control locked. Run /chrome authorize to allow chrome_* tools again.", "info");
 	};
 
 	const onboardHandler = async (ctx: ExtensionContext) => {
@@ -672,12 +678,8 @@ Usage rules:
 		} catch {
 			parts.push(`✗ Chrome not responding`);
 		}
-		try {
-			const t = (await bridge.send("trusted.status", {}, 3_000)) as { mode?: string; attachedTabs?: number[] };
-			const banner = t.attachedTabs?.length ? `, banner on ${t.attachedTabs.length} tab(s)` : "";
-			parts.push(`clicks: ${t.mode ?? "?"}${banner}`);
-		} catch {}
-		parts.push(`quiet: ${backgroundDefault ? "on" : "off"}`);
+		parts.push(`auth: ${authSummary()}`);
+		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
 		return parts.join(" · ");
 	};
 
@@ -685,84 +687,63 @@ Usage rules:
 		ctx.ui.notify(await statusSummary(), "info");
 	};
 
-	// Interactive dialog: each row is a setting whose value cycles with Space/Enter. Enter on
-	// the last value also saves; Esc / 'q' closes. The description below changes with the
-	// current value so users always see what the active setting means.
-	const openSettingsDialog = async (ctx: ExtensionContext): Promise<void> => {
-		// Read current click mode (might fail if extension permission missing).
-		let clicksMode: string = "auto";
-		let permissionGranted = false;
-		try {
-			const t = (await bridge.send("trusted.status", {}, 5_000)) as { mode?: string; permissionGranted?: boolean };
-			clicksMode = t.mode ?? "auto";
-			permissionGranted = !!t.permissionGranted;
-		} catch {}
+	const openAuthorizeMenu = async (ctx: ExtensionContext): Promise<void> => {
+		while (true) {
+			const choice = await ctx.ui.select("Authorize Chrome control", [
+				"15 minutes",
+				"30 minutes",
+				"Indefinite",
+				"Custom minutes",
+			]);
+			if (!choice) return;
+			switch (choice) {
+				case "15 minutes": return authorizeHandler(ctx, "15m");
+				case "30 minutes": return authorizeHandler(ctx, "30m");
+				case "Indefinite": return authorizeHandler(ctx, "indefinite");
+				case "Custom minutes": {
+					const value = await ctx.ui.input("Authorize for how many minutes?", "45");
+					if (!value) continue;
+					return authorizeHandler(ctx, value);
+				}
+			}
+		}
+	};
 
-		const clicksItem: SettingItem = {
-			id: "clicks",
-			label: "Click realism",
-			currentValue: clicksMode,
-			values: ["auto", "on", "off"],
-			description: permissionGranted
-				? (CLICKS_DESC[clicksMode] ?? "")
-				: "Real-looking clicks unavailable: reload the Chrome extension in chrome://extensions and accept the new permission prompt.",
-		};
-		const quietItem: SettingItem = {
-			id: "quiet",
-			label: "Quiet mode",
-			currentValue: backgroundDefault ? "on" : "off",
-			values: ["on", "off"],
-			description: QUIET_DESC[backgroundDefault ? "on" : "off"] ?? "",
-		};
-		const items: SettingItem[] = [clicksItem, quietItem];
+	const openBackgroundMenu = async (ctx: ExtensionContext): Promise<void> => {
+		const choice = await ctx.ui.select("Background / watch mode", [
+			"Use Chrome in background",
+			"Use Chrome in foreground",
+		]);
+		if (!choice) return;
+		switch (choice) {
+			case "Use Chrome in background": return backgroundHandler(ctx, "on");
+			case "Use Chrome in foreground": return backgroundHandler(ctx, "off");
+		}
+	};
 
-		await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-			const container = new Container();
-			container.addChild(new Text(theme.fg("accent", theme.bold("pi-chrome settings")), 1, 1));
-			container.addChild(new Text(theme.fg("muted", "\u2191\u2193 navigate · space/enter cycle · esc close"), 1, 0));
-
-			let list: SettingsList;
-			list = new SettingsList(
-				items,
-				Math.min(items.length + 2, 8),
-				getSettingsListTheme(),
-				(id, newValue) => {
-					if (id === "clicks") {
-						if (!permissionGranted) {
-							ctx.ui.notify("Click mode locked: reload the Chrome extension first.", "warning");
-							// Revert by snapping back to the previous value.
-							list.updateValue("clicks", clicksItem.currentValue);
-							return;
-						}
-						// Mutate description so the help text matches the new value.
-						clicksItem.currentValue = newValue;
-						clicksItem.description = CLICKS_DESC[newValue] ?? "";
-						list.invalidate();
-						void bridge.send("trusted.mode", { mode: newValue }, 5_000).catch((err) => {
-							ctx.ui.notify(`Couldn't switch click mode: ${(err as Error).message}`, "warning");
-						});
-					} else if (id === "quiet") {
-						backgroundDefault = newValue === "on";
-						quietItem.currentValue = newValue;
-						quietItem.description = QUIET_DESC[newValue] ?? "";
-						list.invalidate();
-					}
-				},
-				() => done(undefined),
-			);
-			container.addChild(list);
-
-			return {
-				render: (w) => container.render(w),
-				invalidate: () => container.invalidate(),
-				handleInput: (data: string) => list.handleInput(data),
-			};
-		});
+	const openCommandMenu = async (ctx: ExtensionContext): Promise<void> => {
+		while (true) {
+			const choice = await ctx.ui.select(`pi-chrome\n${await statusSummary()}`, [
+				"Authorize Chrome control…",
+				"Lock Chrome control",
+				"Doctor / troubleshoot",
+				"Background / watch mode…",
+				"Install / onboard extension",
+			]);
+			if (!choice) return;
+			switch (choice) {
+				case "Authorize Chrome control…": await openAuthorizeMenu(ctx); continue;
+				case "Lock Chrome control": return revokeHandler(ctx);
+				case "Doctor / troubleshoot": return doctorHandler(ctx);
+				case "Background / watch mode…": await openBackgroundMenu(ctx); continue;
+				case "Install / onboard extension": return onboardHandler(ctx);
+			}
+		}
 	};
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome status   — one-line snapshot of connection + current modes.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome clicks [auto|off|on|status]  — how realistic should pi-chrome's clicks be.\n  /chrome quiet  [on|off|status|toggle] — whether Chrome pops to the front when pi-chrome acts.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -779,25 +760,25 @@ Usage rules:
 			let candidates: Item[] = [];
 			if (path.length === 0) {
 				candidates = [
-					{ fullValue: "status", label: "status", description: "One-line summary: connection + click mode + quiet mode." },
+					{ fullValue: "authorize", label: "authorize", description: "Allow this Pi session to use chrome_* tools." },
+					{ fullValue: "revoke", label: "revoke", description: "Lock Chrome control for this Pi session." },
+					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
 					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
 					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
-					{ fullValue: "clicks", label: "clicks", description: "How realistic should pi-chrome's clicks be? auto / off / on." },
-					{ fullValue: "quiet", label: "quiet", description: "Should Chrome pop to the front when pi-chrome acts, or work silently?" },
+					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
 				];
-			} else if (path[0] === "clicks" && path.length === 1) {
+			} else if (path[0] === "authorize" && path.length === 1) {
 				candidates = [
-					{ fullValue: "clicks auto", label: "auto", description: "Default. Quiet clicks; upgrade to real-looking ones only when a site rejects them." },
-					{ fullValue: "clicks off", label: "off", description: "Always quiet. No banner. Some sites won't accept the clicks." },
-					{ fullValue: "clicks on", label: "on", description: "Always real-looking. Chrome shows a banner. Best for stubborn sites." },
-					{ fullValue: "clicks status", label: "status", description: "Show the current click mode." },
+					{ fullValue: "authorize 15m", label: "15m", description: "Authorize Chrome control for 15 minutes." },
+					{ fullValue: "authorize 30m", label: "30m", description: "Authorize Chrome control for 30 minutes." },
+					{ fullValue: "authorize indefinite", label: "indefinite", description: "Authorize Chrome control until revoked or Pi exits." },
 				];
-			} else if (path[0] === "quiet" && path.length === 1) {
+			} else if (path[0] === "background" && path.length === 1) {
 				candidates = [
-					{ fullValue: "quiet on", label: "on", description: "Work silently. Chrome stays in the background. Your editor keeps focus." },
-					{ fullValue: "quiet off", label: "off", description: "Bring Chrome to the front so you can watch (default)." },
-					{ fullValue: "quiet toggle", label: "toggle", description: "Flip whichever way it's currently set." },
-					{ fullValue: "quiet status", label: "status", description: "Show the current setting." },
+					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus." },
+					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch (default)." },
+					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
+					{ fullValue: "background status", label: "status", description: "Show the current setting." },
 				];
 			}
 			if (candidates.length === 0) return null;
@@ -808,31 +789,28 @@ Usage rules:
 		handler: async (args, ctx) => {
 			const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
 			if (tokens.length === 0) {
-				await openSettingsDialog(ctx);
+				await openCommandMenu(ctx);
 				return;
 			}
 			const [head, ...rest] = tokens;
 			const subArgs = rest.join(" ");
 			switch (head) {
+				case "authorize": return authorizeHandler(ctx, subArgs);
+				case "revoke": return revokeHandler(ctx);
 				case "status": return statusHandler(ctx);
 				case "doctor": return doctorHandler(ctx);
 				case "onboard": return onboardHandler(ctx);
-				case "clicks":
-				case "trusted": // legacy alias
-					return trustedHandler(ctx, subArgs);
-				case "quiet":
-				case "background": // legacy alias
+				case "background":
 					return backgroundHandler(ctx, subArgs);
 				case "settings": {
-					// Legacy nested form: /chrome settings background ... or /chrome settings trusted ...
+					// Legacy nested form: /chrome settings background ...
 					const [setting, ...settingArgs] = rest;
 					if (setting === "background") return backgroundHandler(ctx, settingArgs.join(" "));
-					if (setting === "trusted") return trustedHandler(ctx, settingArgs.join(" "));
-					ctx.ui.notify(`'/chrome settings' was removed. Use /chrome clicks or /chrome quiet directly.`, "warning");
+					ctx.ui.notify(`'/chrome settings' was removed. Use /chrome background directly.`, "warning");
 					return;
 				}
 				default:
-					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome status | doctor | onboard | clicks | quiet.`, "warning");
+					ctx.ui.notify(`Unknown subcommand '${head}'. Try: /chrome authorize | revoke | status | doctor | onboard | background.`, "warning");
 			}
 		},
 	});
@@ -844,7 +822,7 @@ Usage rules:
 			"Start/check the local bridge used by the companion Chrome extension. This does not launch a separate Chrome profile; install the unpacked Chrome extension in your existing Chrome profile to connect.",
 		promptSnippet: "Show instructions for connecting Pi to the user's existing Chrome profile via the companion extension.",
 		parameters: Type.Object({
-			port: Type.Optional(Type.Number({ description: "Ignored unless PI_CHROME_BRIDGE_PORT is set before Pi starts." })),
+			port: Type.Optional(Type.Number({ description: "Ignored. The bundled Chrome extension polls 127.0.0.1:17318." })),
 			url: Type.Optional(Type.String({ description: "Optional URL to open in the existing Chrome profile after the extension is connected." })),
 			userDataDir: Type.Optional(Type.String({ description: "Ignored. This bridge intentionally uses the user's existing Chrome profile through the companion extension." })),
 			useDefaultProfile: Type.Optional(Type.Boolean({ description: "Ignored; existing-profile access comes from the companion Chrome extension." })),
@@ -852,7 +830,7 @@ Usage rules:
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx): Promise<ToolTextResult> {
 			if (params.url && bridge.connected) {
-				const result = await bridge.send("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS);
+				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS);
 				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
 			}
 			return {
@@ -887,7 +865,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send(`tab.${params.action}`, params, DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend(`tab.${params.action}`, params, DEFAULT_TIMEOUT_MS);
 			if (params.action === "list") {
 				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number }>;
 				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
@@ -918,7 +896,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const snapshot = await bridge.send(
+			const snapshot = await authorizedBridgeSend(
 				"page.snapshot",
 				withBackground({ ...params, maxElements: params.maxElements ?? MAX_ELEMENTS }),
 				DEFAULT_TIMEOUT_MS,
@@ -948,7 +926,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000);
+			const result = await authorizedBridgeSend("page.navigate", withBackground(params), (params.timeoutMs ?? 15_000) + 2_000);
 			return { content: [{ type: "text", text: `Navigated to ${params.url}${params.initScript ? " (with initScript)" : ""}` }], details: { result: result as Json } };
 		},
 	});
@@ -972,7 +950,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const value = await bridge.send("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const value = await authorizedBridgeSend("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const text = value === undefined
 				? "undefined"
 				: typeof value === "string"
@@ -986,7 +964,7 @@ Usage rules:
 		name: "chrome_click",
 		label: "Chrome Click",
 		description:
-			"Click a snapshot uid, CSS selector, or viewport coordinate. Default 'auto' mode runs synthetic DOM events first and silently retries with trusted CDP only when the click looks gated (no page change + affordance label matches play/copy/share/sign-in/etc, or a recent NotAllowedError). The 'started debugging' banner appears only when the retry actually happens. Pass trusted=true to force CDP for this call (banner appears immediately). Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after the click.",
+			"Click a snapshot uid, CSS selector, or viewport coordinate using Chrome's real input layer. Pass includeSnapshot=true to return a fresh snapshot after the click.",
 		promptSnippet: "Click page elements in Chrome by snapshot uid, selector, or viewport coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot. Prefer uid over selector after taking a snapshot." })),
@@ -1001,12 +979,11 @@ Usage rules:
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, click silently without focusing Chrome. Default false." }),
 			),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP so the event is browser-trusted (isTrusted=true, user-activation satisfied). Triggers Chrome's 'started debugging this browser' banner." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await bridge.send("page.click", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const raw = await authorizedBridgeSend("page.click", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
@@ -1019,7 +996,7 @@ Usage rules:
 		name: "chrome_type",
 		label: "Chrome Type",
 		description:
-			"Focus an optional snapshot uid or CSS selector, then type text. Default 'auto' mode runs synthetic per-character keydown/beforeinput/input/keyup first; if the input value doesn't change at all (editor rejected synthetic input) the call is silently retried through chrome.debugger so each keystroke is browser-trusted (isTrusted=true). Pass trusted=true to force CDP for this call. Pass trusted=false to skip retry. Pass includeSnapshot=true to return a fresh snapshot after typing.",
+			"Focus an optional snapshot uid or CSS selector, then type text using Chrome's real keyboard input. Pass includeSnapshot=true to return a fresh snapshot after typing.",
 		promptSnippet: "Type text into Chrome, optionally focusing a snapshot uid or selector first.",
 		parameters: Type.Object({
 			text: Type.String(),
@@ -1034,12 +1011,11 @@ Usage rules:
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, type silently without focusing Chrome. Default false." }),
 			),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP so each keystroke is browser-trusted. Triggers Chrome's debugger banner." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await bridge.send("page.type", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const raw = await authorizedBridgeSend("page.type", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1052,7 +1028,7 @@ Usage rules:
 		name: "chrome_fill",
 		label: "Chrome Fill",
 		description:
-			"Set the full value of a text input, textarea, or contenteditable element using framework-aware native value setters and input/change events. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
+			"Set the full value of a text input, textarea, or contenteditable element using Chrome click/select/delete/type input. Accepts a snapshot uid or CSS selector. Pass includeSnapshot=true to verify after filling.",
 		promptSnippet: "Fill a Chrome form field by snapshot uid or selector, optionally returning a fresh snapshot.",
 		parameters: Type.Object({
 			text: Type.String(),
@@ -1067,12 +1043,11 @@ Usage rules:
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, fill silently without focusing Chrome. Default false." }),
 			),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP for browser-trusted input. Triggers Chrome's debugger banner." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await bridge.send("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const raw = await authorizedBridgeSend("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const into = params.uid || params.selector ? ` into ${params.uid ?? params.selector}` : "";
@@ -1094,7 +1069,7 @@ Usage rules:
 				ctrlKey: Type.Optional(Type.Boolean()),
 				altKey: Type.Optional(Type.Boolean()),
 				metaKey: Type.Optional(Type.Boolean()),
-			}, { description: "Modifier keys to hold while pressing the key (chord). Only honoured for trusted-mode presses; synthetic path ignores." })),
+			}, { description: "Modifier keys to hold while pressing the key (chord)." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the keypress." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
@@ -1103,12 +1078,11 @@ Usage rules:
 			background: Type.Optional(
 				Type.Boolean({ description: "If true, send the key silently without focusing Chrome. Default false." }),
 			),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP so the keystroke is browser-trusted." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const raw = await bridge.send("page.key", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const raw = await authorizedBridgeSend("page.key", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const result = (params.includeSnapshot ? (raw as { result: unknown }).result : raw) as Json;
 			const summary = summarizeActionResult(result);
 			const base = `Pressed ${params.key}.`;
@@ -1133,7 +1107,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000);
+			const result = await authorizedBridgeSend("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000);
 			return { content: [{ type: "text", text: `Observed ${params.kind}: ${params.value}` }], details: { result: result as Json } };
 		},
 	});
@@ -1154,7 +1128,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1176,7 +1150,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1196,7 +1170,7 @@ Usage rules:
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
 		},
 	});
@@ -1226,7 +1200,7 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-screenshots", `${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			const result = (await bridge.send("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS)) as {
+			const result = (await authorizedBridgeSend("page.screenshot", withBackground(params), params.fullPage ? 120_000 : DEFAULT_TIMEOUT_MS)) as {
 				dataUrl?: string;
 				tab?: unknown;
 				fullPage?: boolean;
@@ -1263,7 +1237,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_hover",
 		label: "Chrome Hover",
-		description: "Hover over an element (synthetic pointerover/mouseover/pointermove) by uid, selector, or x/y. Triggers CSS :hover state and any JS hover handlers; isTrusted is false.",
+		description: "Hover over an element by uid, selector, or x/y using Chrome pointer movement.",
 		promptSnippet: "Hover a Chrome element to trigger :hover / mouseover handlers.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),
@@ -1274,10 +1248,9 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP for browser-trusted hover." })),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.hover", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: `Hovered ${params.uid ?? params.selector ?? `${params.x},${params.y}`}` }], details: { result: result as Json } };
 		},
 	});
@@ -1285,7 +1258,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_drag",
 		label: "Chrome Drag",
-		description: "Synthetic drag from one uid/selector/point to another. Dispatches pointerdown → humanised pointermove path → dragstart/drag/dragenter/dragover/dragleave/drop/dragend with a shared HTML5 DataTransfer, then pointerup. isTrusted=false.",
+		description: "Drag from one uid/selector/point to another using Chrome pointer input.",
 		promptSnippet: "Drag a Chrome element from one point to another.",
 		parameters: Type.Object({
 			fromUid: Type.Optional(Type.String()),
@@ -1301,10 +1274,9 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch through chrome.debugger / CDP so the drag is browser-trusted (real HTML5 dragstart/drop with native DataTransfer)." })),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.drag", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: `Dragged from ${params.fromUid ?? params.fromSelector} to ${params.toUid ?? params.toSelector}` }], details: { result: result as Json } };
 		},
 	});
@@ -1313,7 +1285,7 @@ Usage rules:
 		name: "chrome_tap",
 		label: "Chrome Tap (Touch)",
 		description:
-			"Dispatch a real browser-trusted touchstart/touchend tap via chrome.debugger (CDP Input.dispatchTouchEvent). Use for sites that gate on TouchEvent rather than MouseEvent (mobile-first PWAs, swipe carousels). Always uses the trusted CDP path — the 'started debugging' banner appears.",
+			"Dispatch a real touchstart/touchend tap through Chrome's input layer. Use for sites that gate on TouchEvent rather than MouseEvent (mobile-first PWAs, swipe carousels). Chrome may show its debugging banner while attached.",
 		promptSnippet: "Tap (real touch) a Chrome element by snapshot uid, selector, or coordinate.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),
@@ -1326,7 +1298,7 @@ Usage rules:
 			background: Type.Optional(Type.Boolean()),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.tap", withBackground(params), DEFAULT_TIMEOUT_MS);
 			const target = params.uid ?? params.selector ?? `${params.x},${params.y}`;
 			return { content: [{ type: "text", text: `Tapped ${target} (touch)` }], details: { result: result as Json } };
 		},
@@ -1347,10 +1319,9 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(Type.Boolean()),
-			trusted: Type.Optional(Type.Boolean({ description: "If true, dispatch wheel events through chrome.debugger / CDP for browser-trusted scrolling." })),
 		}),
 		async execute(_id, params): Promise<ToolTextResult> {
-			const result = await bridge.send("page.scroll", withBackground(params), DEFAULT_TIMEOUT_MS);
+			const result = await authorizedBridgeSend("page.scroll", withBackground(params), DEFAULT_TIMEOUT_MS);
 			return { content: [{ type: "text", text: `Scrolled dy=${params.deltaY ?? 0} dx=${params.deltaX ?? 0}` }], details: { result: result as Json } };
 		},
 	});
@@ -1358,7 +1329,7 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_upload_file",
 		label: "Chrome Upload File",
-		description: "Programmatically set the files of an <input type=file> element from local file paths. Uses DataTransfer to populate input.files and dispatches input+change events. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
+		description: "Attach local files to an <input type=file> element using Chrome DevTools file-input control. Does NOT open the native file picker; works with React/Vue/Angular controlled inputs.",
 		promptSnippet: "Attach local files to a Chrome <input type=file> without opening the native file picker.",
 		parameters: Type.Object({
 			uid: Type.Optional(Type.String()),
@@ -1370,17 +1341,10 @@ Usage rules:
 			background: Type.Optional(Type.Boolean()),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx): Promise<ToolTextResult> {
-			const { readFile } = await import("node:fs/promises");
-			const { basename } = await import("node:path");
 			const cwd = workspaceCwd(ctx);
-			const files: Array<{ name: string; type: string; base64: string }> = [];
-			for (const p of params.paths) {
-				const abs = resolve(cwd, p);
-				const buf = await readFile(abs);
-				files.push({ name: basename(abs), type: "application/octet-stream", base64: buf.toString("base64") });
-			}
-			const result = await bridge.send("page.upload", withBackground({ ...params, files }), DEFAULT_TIMEOUT_MS);
-			return { content: [{ type: "text", text: `Uploaded ${files.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
+			const paths = params.paths.map((p) => resolve(cwd, p));
+			const result = await authorizedBridgeSend("page.upload", withBackground({ ...params, paths }), DEFAULT_TIMEOUT_MS);
+			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
 		},
 	});
 }

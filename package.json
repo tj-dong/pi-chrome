@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.15.2",
+	"version": "0.15.15",
 	"scripts": {
 		"version": "node scripts/sync-manifest-version.js",
 		"prepublishOnly": "node scripts/sync-manifest-version.js"
@@ -36,7 +36,10 @@
 		"stagehand-alternative"
 	],
 	"license": "MIT",
-	"author": { "name": "tianrendong", "company": "Earendil Inc." },
+	"author": {
+		"name": "tianrendong",
+		"company": "Earendil Inc."
+	},
 	"homepage": "https://github.com/tianrendong/pi-chrome#readme",
 	"repository": {
 		"type": "git",

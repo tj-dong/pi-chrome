@@ -3,64 +3,23 @@ const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 let polling = false;
 
-// =================== Trusted-input (CDP) layer ===================
-// Tracks which tabs we have attached chrome.debugger to, plus session-level mode.
+// =================== Chrome input (CDP) layer ===================
+// Tracks which tabs we have attached chrome.debugger to.
 const attachedTabs = new Map(); // tabId -> { detachAt: number, pointer: {x,y} }
-let TRUSTED_MODE = "auto"; // "off" | "on" | "auto" (default: smart retry only)
-const TRUSTED_IDLE_DETACH_MS = 15_000;
+const INPUT_IDLE_DETACH_MS = 15_000;
 const CDP_VERSION = "1.3";
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function rng(min, max) { return min + Math.random() * (max - min); }
 
-async function wantsTrusted(params) {
-  if (params && params.trusted === false) return false;
-  if (params && params.trusted === true) return true;
-  return TRUSTED_MODE === "on";
-}
-
-function setTrustedMode(mode) {
-  const next = String(mode || "").toLowerCase();
-  if (!["off", "on", "auto"].includes(next)) throw new Error(`bad trusted mode: ${next}`);
-  TRUSTED_MODE = next;
-  if (next === "off") void detachAll();
-  return { mode: TRUSTED_MODE };
-}
-
-function trustedStatus() {
+function inputStatus() {
   return {
-    mode: TRUSTED_MODE,
     attachedTabs: Array.from(attachedTabs.keys()),
     permissionGranted: typeof chrome !== "undefined" && !!chrome.debugger,
   };
 }
 
-// Auto-upgrade: if synthetic result carries suggestTrusted=true, the bridge mode is "auto"
-// (default) or "on", and the caller didn't explicitly opt out, retry once with trusted CDP
-// path. Surfaces both results so callers can see what happened.
-async function maybeUpgradeToTrusted(kind, params, syntheticResult, trustedFn) {
-  if (!syntheticResult || !syntheticResult.suggestTrusted) return syntheticResult;
-  if (params && params.trusted === false) return syntheticResult;
-  if (TRUSTED_MODE === "off") return syntheticResult;
-  if (!chrome.debugger) return syntheticResult;
-  try {
-    const trustedResult = await trustedFn();
-    return {
-      ...trustedResult,
-      autoRetried: true,
-      autoRetryReason: syntheticResult.suggestReason || `${kind} produced no mutation`,
-      syntheticAttempt: { pageMutated: syntheticResult.pageMutated, suggestReason: syntheticResult.suggestReason },
-    };
-  } catch (error) {
-    return {
-      ...syntheticResult,
-      autoRetryAttempted: true,
-      autoRetryError: error?.message || String(error),
-    };
-  }
-}
-
-// Last few attach failures, kept for /chrome doctor + trusted.debug diagnostics.
+// Last few attach failures, kept for diagnostics.
 const attachDebugLog = [];
 function recordAttachEvent(entry) {
   attachDebugLog.push({ ...entry, t: Date.now() });
@@ -71,7 +30,7 @@ async function attachDebugger(tabId) {
   if (!chrome.debugger) throw new Error("chrome.debugger API unavailable; reload the extension to grant the new permission");
   if (attachedTabs.has(tabId)) {
     const entry = attachedTabs.get(tabId);
-    entry.detachAt = Date.now() + TRUSTED_IDLE_DETACH_MS;
+    entry.detachAt = Date.now() + INPUT_IDLE_DETACH_MS;
     return entry;
   }
   // Before each attach, force-detach any stale CDP target this extension owns on the tab.
@@ -123,19 +82,18 @@ async function attachDebugger(tabId) {
   }
   recordAttachEvent({ kind: "attached", tabId });
   // Seed pointer in a plausible "just left the address bar" location.
-  const entry = { detachAt: Date.now() + TRUSTED_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } };
+  const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } };
   attachedTabs.set(tabId, entry);
   return entry;
 }
 
-async function trustedDebug(params) {
+async function inputDebug(params) {
   const tab = params?.targetId ? await chrome.tabs.get(Number(params.targetId)).catch(() => null) : null;
   let targets = [];
   try { targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))); } catch {}
   return {
     extensionVersion: chrome.runtime.getManifest().version,
     extensionId: chrome.runtime.id,
-    trustedMode: TRUSTED_MODE,
     attachedTabs: Array.from(attachedTabs.keys()),
     requestedTab: tab ? { id: tab.id, url: tab.url, status: tab.status, title: tab.title } : null,
     cdpTargets: targets,
@@ -158,7 +116,7 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
     if (tabId !== undefined) attachedTabs.delete(tabId);
     if (reason === "canceled_by_user") {
-      console.warn(`[pi-chrome] debugger canceled by user on tab ${tabId}; trusted mode will reattach on next call`);
+      console.warn(`[pi-chrome] debugger canceled by user on tab ${tabId}; Chrome input will reattach on next call`);
     }
   });
 }
@@ -166,7 +124,7 @@ if (chrome.debugger && chrome.debugger.onDetach) {
 setInterval(() => {
   const now = Date.now();
   for (const [tabId, entry] of attachedTabs) {
-    if (entry.detachAt && entry.detachAt < now && TRUSTED_MODE !== "on") {
+    if (entry.detachAt && entry.detachAt < now) {
       void detachDebugger(tabId);
     }
   }
@@ -245,7 +203,7 @@ async function cdp(tabId, method, params) {
           const id = extractForeignExtId(after) || extractForeignExtId(before) || "unknown";
           throw new Error(
             `Another Chrome extension (${id}) has an input overlay on this page (e.g. a password manager / autofill popup). \n` +
-            `pi-chrome tried to dismiss it with Escape but it reappeared. Disable that extension on this page, focus the field via Tab instead of clicking, or run /chrome quiet off so the agent uses synthetic input here.`,
+            `pi-chrome tried to dismiss it with Escape but it reappeared. Disable that extension on this page, close its popup, or focus the field via Tab instead of clicking.`,
           );
         }
         throw retryErr;
@@ -254,7 +212,7 @@ async function cdp(tabId, method, params) {
     if (!isStale) throw error;
     attachedTabs.delete(tabId);
     await chrome.debugger.attach({ tabId }, CDP_VERSION).catch(() => undefined);
-    attachedTabs.set(tabId, { detachAt: Date.now() + TRUSTED_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } });
+    attachedTabs.set(tabId, { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } });
     return cdpRaw(tabId, method, params);
   }
 }
@@ -280,7 +238,7 @@ async function resolveTargetInTab(tabId, params) {
     args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
   });
   const v = results?.[0]?.result;
-  if (!v || !v.found) throw new Error("Could not resolve target element for trusted action");
+  if (!v || !v.found) throw new Error("Could not resolve target element for Chrome input");
   return v;
 }
 
@@ -378,7 +336,7 @@ async function cdpTypeChar(tabId, ch) {
   await sleep(rng(35, 130));
 }
 
-async function trustedClick(params) {
+async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -390,7 +348,7 @@ async function trustedClick(params) {
   await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
   // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
   // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
-  // pointer focus to suppress the focus ring (synthetic clicks naturally land on false).
+  // Reset focus styling after pointer click when possible.
   if (params.selector || params.uid) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [0] },
@@ -407,10 +365,10 @@ async function trustedClick(params) {
       args: [params.selector ?? null, params.uid ?? null],
     }).catch(() => undefined);
   }
-  return { trusted: true, x: point.x, y: point.y, tag: resolved.tag };
+  return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
 }
 
-async function trustedHover(params) {
+async function chromeInputHover(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -418,15 +376,15 @@ async function trustedHover(params) {
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
   await cdpMoveTo(tab.id, point.x, point.y);
   await sleep(rng(80, 220));
-  return { trusted: true, x: point.x, y: point.y, tag: resolved.tag };
+  return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
 }
 
-async function trustedKey(params) {
+async function chromeInputKey(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
   const key = String(params.key || "");
-  if (!key) throw new Error("trusted.key: missing key");
+  if (!key) throw new Error("chrome.key: missing key");
   const mods = params.modifiers || {};
   const modBits = cdpModifiersFor(mods);
   // Press modifiers in standard order, then key, then release in reverse.
@@ -456,10 +414,10 @@ async function trustedKey(params) {
     await sleep(rng(5, 18));
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: 0 });
   }
-  return { trusted: true, key: info.key, modifiers: mods };
+  return { input: "chrome", key: info.key, modifiers: mods };
 }
 
-async function trustedType(params) {
+async function chromeInputType(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -477,16 +435,16 @@ async function trustedType(params) {
   for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
   if (params.pressEnter) {
     await cdpTypeChar(tab.id, "\r").catch(() => undefined);
-    await trustedKey({ ...params, key: "Enter" });
+    await chromeInputKey({ ...params, key: "Enter" });
   }
-  return { trusted: true, length: text.length };
+  return { input: "chrome", length: text.length };
 }
 
-async function trustedFill(params) {
+async function chromeInputFill(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
-  if (!(params.selector || params.uid)) throw new Error("trusted.fill: selector or uid required");
+  if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
   const resolved = await resolveTargetInTab(tab.id, params);
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
   await cdpMoveTo(tab.id, point.x, point.y);
@@ -503,11 +461,11 @@ async function trustedFill(params) {
   await sleep(rng(20, 60));
   const text = String(params.text || "");
   for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
-  if (params.submit) await trustedKey({ ...params, key: "Enter" });
-  return { trusted: true, length: text.length };
+  if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
+  return { input: "chrome", length: text.length };
 }
 
-async function trustedScroll(params) {
+async function chromeInputScroll(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -554,26 +512,26 @@ async function trustedScroll(params) {
     // Sleep one+ frame so IntersectionObserver / rAF samples can run between events.
     await sleep(rng(22, 48));
   }
-  return { trusted: true, deltaX: totalX, deltaY: totalY, steps: n };
+  return { input: "chrome", deltaX: totalX, deltaY: totalY, steps: n };
 }
 
-async function trustedTap(params) {
+async function chromeInputTap(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
   const resolved = (params.selector || params.uid || (typeof params.x === "number" && typeof params.y === "number"))
     ? await resolveTargetInTab(tab.id, params)
     : null;
-  if (!resolved || !resolved.found) throw new Error("trusted.tap: target not found");
+  if (!resolved || !resolved.found) throw new Error("chrome.tap: target not found");
   const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
   const tp = { x: point.x, y: point.y, radiusX: 8, radiusY: 8, rotationAngle: 0, force: 0.5, id: 1 };
   await cdp(tab.id, "Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [tp] });
   await sleep(rng(40, 110));
   await cdp(tab.id, "Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-  return { trusted: true, x: point.x, y: point.y, tag: resolved.tag };
+  return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
 }
 
-async function trustedDrag(params) {
+async function chromeInputDrag(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -595,7 +553,40 @@ async function trustedDrag(params) {
     await sleep(rng(10, 26));
   }
   await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: tp.x, y: tp.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
-  return { trusted: true, from: fp, to: tp, steps };
+  return { input: "chrome", from: fp, to: tp, steps };
+}
+
+async function chromeInputUpload(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  await attachDebugger(tab.id);
+  if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
+  const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
+  if (!paths.length) throw new Error("chrome.upload: no file paths provided");
+  const expression = `(() => {
+    const selector = ${JSON.stringify(params.selector ?? null)};
+    const uid = ${JSON.stringify(params.uid ?? null)};
+    const state = window.__PI_CHROME_STATE__;
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
+    if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    return el;
+  })()`;
+  const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
+  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
+  const objectId = evaluated.result?.objectId;
+  if (!objectId) throw new Error("Could not resolve file input object");
+  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
+  const requested = await cdp(tab.id, "DOM.requestNode", { objectId });
+  if (!requested.nodeId) throw new Error("Could not resolve file input node");
+  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId: requested.nodeId, files: paths });
+  await cdp(tab.id, "Runtime.callFunctionOn", {
+    objectId,
+    functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
+    returnByValue: true,
+  }).catch(() => undefined);
+  await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+  return { input: "chrome", uploaded: paths.map((path) => ({ path })) };
 }
 // ===============================================================
 
@@ -720,41 +711,28 @@ async function dispatch(action, params) {
       ]);
     case "page.evaluate":
       return evaluateInTab(params);
-    case "page.click": {
-      if (await wantsTrusted(params)) return trustedClick(params);
-      const synth = await executeActionInTab(params, clickPage, [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null]);
-      return await maybeUpgradeToTrusted("click", params, synth, () => trustedClick(params));
-    }
+    case "page.click":
+      return chromeInputClick(params);
     case "page.hover":
-      if (await wantsTrusted(params)) return trustedHover(params);
-      return executeActionInTab(params, hoverPage, [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null]);
+      return chromeInputHover(params);
     case "page.drag":
-      if (await wantsTrusted(params)) return trustedDrag(params);
-      return executeActionInTab(params, dragPage, [params.fromUid ?? null, params.fromSelector ?? null, params.fromX ?? null, params.fromY ?? null, params.toUid ?? null, params.toSelector ?? null, params.toX ?? null, params.toY ?? null, params.steps ?? 12]);
+      return chromeInputDrag(params);
     case "page.upload":
-      return executeActionInTab(params, uploadFiles, [params.selector ?? null, params.uid ?? null, params.files || []]);
-    case "page.type": {
-      if (await wantsTrusted(params)) return trustedType(params);
-      const synth = await executeActionInTab(params, typeIntoPage, [params.selector ?? null, params.uid ?? null, params.text || "", Boolean(params.pressEnter)]);
-      return await maybeUpgradeToTrusted("type", params, synth, () => trustedType(params));
-    }
+      return chromeInputUpload(params);
+    case "page.type":
+      return chromeInputType(params);
     case "page.fill":
-      if (await wantsTrusted(params)) return trustedFill(params);
-      return executeActionInTab(params, fillPage, [params.selector ?? null, params.uid ?? null, params.text || "", params.submit === true]);
+      return chromeInputFill(params);
     case "page.key":
-      if (await wantsTrusted(params)) return trustedKey(params);
-      return executeActionInTab(params, pressKeyInPage, [params.key]);
+      return chromeInputKey(params);
     case "page.scroll":
-      if (await wantsTrusted(params)) return trustedScroll(params);
-      return executeActionInTab(params, scrollPage, [params.selector ?? null, params.uid ?? null, params.deltaY ?? 0, params.deltaX ?? 0, params.steps ?? null]);
+      return chromeInputScroll(params);
     case "page.tap":
-      return trustedTap(params);
-    case "trusted.mode":
-      return setTrustedMode(params.mode);
-    case "trusted.status":
-      return trustedStatus();
-    case "trusted.debug":
-      return trustedDebug(params);
+      return chromeInputTap(params);
+    case "input.status":
+      return inputStatus();
+    case "input.debug":
+      return inputDebug(params);
     case "page.console.list":
       return executeInTab(params, listConsoleMessages, [params.clear === true]);
     case "page.network.list":
@@ -1503,31 +1481,31 @@ async function clickPage(selector, uid, x, y) {
   defaultPrevented = dispatchPointerLikeEvent(point.element, "click", point.x, point.y, prevX, prevY) || defaultPrevented;
   state.pointer = { x: point.x, y: point.y, t: performance.now() };
   // Heuristic: if the clicked thing looks like a media play affordance and the page has paused
-  // audio/video, the synthetic click may not unlock autoplay. Surface a warning.
+  // audio/video, the DOM-event click may not unlock autoplay. Surface a warning.
   let autoplayHint;
   const labelRaw = (point.element.getAttribute("aria-label") || point.element.textContent || "").trim();
   const label = labelRaw.toLowerCase();
   if (/^(play|start|begin|next|continue|unmute)/.test(label)) {
     const idleMedia = Array.from(document.querySelectorAll("audio,video")).some((m) => m.paused);
-    if (idleMedia) autoplayHint = "This element looks like a media affordance and the page has paused media. Synthetic clicks do not satisfy user-activation gates; audio/video may not start.";
+    if (idleMedia) autoplayHint = "This element looks like a media affordance and the page has paused media. DOM-event clicks do not satisfy user-activation gates; audio/video may not start.";
   }
   const pageMutated = pageHash() !== before;
-  // Smart-auto retry hint: only set when synthetic produced no observable change AND the
+  // Smart-auto retry hint: only set when DOM-event path produced no observable change AND the
   // element looks gated, OR the page just emitted a user-activation rejection. The dispatcher
-  // uses this to decide whether to retry with trusted mode.
-  let suggestTrusted = false;
+  // uses this to decide whether to retry with Chrome input.
+  let suggestChromeInput = false;
   let suggestReason;
   if (!pageMutated) {
-    if (autoplayHint) { suggestTrusted = true; suggestReason = "play/media affordance + idle media"; }
+    if (autoplayHint) { suggestChromeInput = true; suggestReason = "play/media affordance + idle media"; }
     else if (/copy(\s|$)|paste|share|download|fullscreen|sign in with|continue with|allow|enable/i.test(label)) {
-      suggestTrusted = true; suggestReason = `label '${labelRaw.slice(0, 40)}' looks gated`;
+      suggestChromeInput = true; suggestReason = `label '${labelRaw.slice(0, 40)}' looks gated`;
     } else {
       // Inspect recent console errors for activation-gate rejections.
       const recent = (state.console || []).slice(-8);
       const hit = recent.find((e) => /NotAllowedError|Document is not focused|requires transient activation|gesture is required/.test(
         (e.args || []).map((a) => typeof a === "string" ? a : (a && a.message) || JSON.stringify(a)).join(" ")
       ));
-      if (hit) { suggestTrusted = true; suggestReason = "recent console error indicates user-activation gate"; }
+      if (hit) { suggestChromeInput = true; suggestReason = "recent console error indicates user-activation gate"; }
     }
   }
   return {
@@ -1537,13 +1515,13 @@ async function clickPage(selector, uid, x, y) {
     uid,
     tag: point.element.tagName,
     label: labelRaw.slice(0, 80) || undefined,
-    isTrusted: false,
+    input: "dom",
     defaultPrevented,
     elementVisible: visible,
     occludedBy: occluded || undefined,
     pageMutated,
     autoplayHint,
-    suggestTrusted: suggestTrusted || undefined,
+    suggestChromeInput: suggestChromeInput || undefined,
     suggestReason,
   };
 }
@@ -1561,7 +1539,7 @@ async function hoverPage(selector, uid, x, y) {
   }
   // Small dwell so hover-intent handlers fire.
   await sleepPage(rand(80, 220));
-  return { x: point.x, y: point.y, selector, uid, tag: point.element.tagName, defaultPrevented, isTrusted: false };
+  return { x: point.x, y: point.y, selector, uid, tag: point.element.tagName, defaultPrevented, input: "dom" };
 }
 
 async function dragPage(fromUid, fromSelector, fromX, fromY, toUid, toSelector, toX, toY, steps) {
@@ -1627,7 +1605,7 @@ async function dragPage(fromUid, fromSelector, fromX, fromY, toUid, toSelector, 
     to: { x: to.x, y: to.y },
     steps: n,
     pageMutated: pageHash() !== before,
-    note: "Synthetic drag with HTML5 DragEvent + shared DataTransfer. isTrusted is still false.",
+    note: "DOM-event drag with HTML5 DragEvent + shared DataTransfer.",
   };
 }
 
@@ -1677,7 +1655,7 @@ async function scrollPage(selector, uid, deltaY, deltaX, steps) {
     deltaX: movedX, deltaY: movedY, steps: n,
     scrollTop: target.scrollTop, scrollLeft: target.scrollLeft,
     pageMutated: pageHash() !== before,
-    isTrusted: false,
+    input: "dom",
   };
 }
 
@@ -1800,18 +1778,18 @@ async function typeIntoPage(selector, uid, text, pressEnter) {
   const finalValue = "value" in element ? element.value : element.textContent;
   const valueMatches = "value" in element ? element.value.includes(text) : (element.textContent || "").includes(text);
   const pageMutated = pageHash() !== before;
-  // Smart-auto retry hint when typing didn't land at all (e.g., editor blocks synthetic input).
-  let suggestTrusted = false, suggestReason;
+  // Smart-auto retry hint when typing didn't land at all (e.g., editor blocks DOM-event input).
+  let suggestChromeInput = false, suggestReason;
   if (text.length > 0 && initialValue === finalValue) {
-    suggestTrusted = true;
-    suggestReason = "value did not change — editor likely rejects synthetic input";
+    suggestChromeInput = true;
+    suggestReason = "value did not change — editor likely rejects DOM-event input";
   }
   return {
     selector, uid, length: text.length, pressEnter,
-    isTrusted: false,
+    input: "dom",
     valueMatches,
     pageMutated,
-    suggestTrusted: suggestTrusted || undefined,
+    suggestChromeInput: suggestChromeInput || undefined,
     suggestReason,
   };
 }
@@ -1836,7 +1814,7 @@ function fillPage(selector, uid, text, submit) {
   if (submit) pressKeyInPage("Enter");
   return {
     selector, uid, length: String(text).length, submit,
-    isTrusted: false,
+    input: "dom",
     valueMatches: "value" in element ? element.value === String(text) : undefined,
     pageMutated: pageHash() !== before,
   };
@@ -1890,7 +1868,7 @@ async function pressKeyInPage(key) {
   }
   return {
     key: normalized,
-    isTrusted: false,
+    input: "dom",
     defaultPrevented: down.defaultPrevented || up.defaultPrevented,
     pageMutated: pageHash() !== before,
   };

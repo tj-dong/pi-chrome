@@ -14,23 +14,23 @@ By default no — extensions need explicit "Allow in incognito" permission. Togg
 
 ## Will sites detect that I'm automating?
 
-For **synthetic** (quiet) input: yes, technically. `event.isTrusted` is `false`. Most sites don't check; some anti-bot defenses do.
+Interactive controls use Chrome's real input layer via CDP: pointer paths are humanized, key cadence has variance, and normal user-activation gates are satisfied. Some detectors check for the `chrome.debugger` API attached and Chrome will show the "Chrome is being debugged" banner.
 
-For **trusted** (CDP) input: events are `isTrusted=true`, pointer paths are humanized, key cadence has variance. Most fingerprint-based detectors don't fire. Some specifically check for the `chrome.debugger` API attached and will show the "Chrome is being debugged" banner. That banner is the visible cost of trusted mode.
-
-The [`test-suite/`](../test-suite) grades both modes against common detection signals.
+The [`test-suite/`](../test-suite) grades browser-control behavior against common detection signals.
 
 ## Why do I see a banner saying "Pi Chrome Connector started debugging this browser"?
 
-That's Chrome's built-in warning when an extension uses `chrome.debugger`. pi-chrome uses it only in trusted-input mode. If you don't want to see it, run `/chrome clicks off` and accept that some sign-in flows / file pickers / clipboard ops won't work.
+That's Chrome's built-in warning when an extension uses `chrome.debugger`. pi-chrome uses Chrome's input layer for interactive controls, so the banner appears while attached.
 
 ## Can a malicious page escape and access my other tabs?
 
-No — pages cannot directly talk to extensions. Commands flow agent → local bridge (`127.0.0.1:17318`) → extension → tab. The bridge binds to loopback only. The risk surface is **other local processes** that could connect to `127.0.0.1:17318` and impersonate Pi. If that's in your threat model, run pi-chrome on a separate user account.
+No — pages cannot directly talk to extensions. Commands flow agent → local bridge (`127.0.0.1:17318`) → extension → tab. The bridge binds to loopback only and rejects browser-origin command requests, so ordinary web pages cannot use CORS to drive it.
+
+Chrome control is also locked per Pi session until you run `/chrome authorize`; `/chrome revoke` locks it again. The remaining risk surface is **other local processes running as you** that can connect to loopback and imitate Pi. If that's in your threat model, run pi-chrome in a separate OS user account.
 
 ## Can multiple Pi sessions use it at once?
 
-Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Planner + worker + audit can all drive the same Chrome concurrently.
+Yes. The first session opens the local bridge; later sessions detect it and pipe their commands through the same bridge. Each Pi session must be authorized with `/chrome authorize` before its chrome_* tools work.
 
 ## Why can't this be on the Chrome Web Store?
 
@@ -38,7 +38,7 @@ Web Store extensions cannot communicate with a local process bridge controlled b
 
 ## What happens when I update pi-chrome?
 
-`/chrome doctor` will warn you if the loaded extension is older than the installed `pi-chrome`. Reload it from `chrome://extensions` to pick up the new version. Trusted-input mode in particular requires re-approving the `debugger` permission once.
+`/chrome doctor` will warn you if the loaded extension is older than the installed `pi-chrome`. Reload it from `chrome://extensions` to pick up the new version. Updates that add Chrome permissions may require re-approval once.
 
 ## What's the install footprint?
 
@@ -51,24 +51,24 @@ The Pi-facing tools are thin wrappers around an HTTP bridge at `127.0.0.1:17318`
 
 ## Does `chrome_evaluate` work on strict-CSP pages?
 
-Yes. The handler compiles with `new Function(...)` in the MAIN world, which works under `script-src 'self'` without `'unsafe-eval'`. Multi-statement bodies are supported via a statement-mode fallback. Exceptions are surfaced to the agent.
+Not always. `chrome_evaluate` and `chrome_snapshot` run in the page's MAIN world through the Function constructor, so pages whose CSP blocks `'unsafe-eval'` can reject them. `chrome_screenshot`, `chrome_navigate`, tab tools, and real Chrome input still work because they use extension/browser APIs rather than page JavaScript.
 
 ## Why does my click return `pageMutated=false`?
 
 Either:
 - The element was occluded (look for `occludedBy: <selector>` in the envelope).
 - The click handler called `event.preventDefault()` and the page intentionally ignored it.
-- The site rejects synthetic events. Try `trusted: true` or `/chrome clicks on`.
+- The target changed after your snapshot; take a fresh snapshot or screenshot.
 
 The result envelope tells you which one. **Don't blind-retry.**
 
 ## Why does `chrome_type` return `valueMatches=false`?
 
-The editor rejected the synthetic input. Common culprits: contenteditable rich-text editors, native date pickers, masked-input libraries. Try `chrome_fill` (uses framework-aware native setters) or `trusted: true`.
+The field rejected or transformed the typed value. Common culprits: contenteditable rich-text editors, native date pickers, masked-input libraries, or masks. Try `chrome_fill`, then verify with `includeSnapshot=true`.
 
 ## How do I attach a file to a React file input?
 
-`chrome_upload_file` — populates `input.files` via a real `DataTransfer` and fires `input` + `change` events. It does **not** open the native file picker (no synthetic event can; that's a user-activation gate). Works with React/Vue/Angular controlled inputs.
+`chrome_upload_file` — uses Chrome DevTools file-input control and fires `input` + `change` events. It does **not** open the native file picker. Works with React/Vue/Angular controlled inputs.
 
 ## Can it record videos?
 

@@ -36,21 +36,21 @@ We benchmark in public — see [`../test-suite/`](../test-suite). Where exact sc
 
 ## Axis 1 — drivers (where pi-chrome lives)
 
-| Tool                              | Transport                                  | Profile                            | Trusted events       | Banner when controlling            | Default detectable as bot |
+| Tool                              | Transport                                  | Profile                            | Browser input        | Banner when controlling            | Default detectable as bot |
 | --------------------------------- | ------------------------------------------ | ---------------------------------- | -------------------- | ----------------------------------- | ------------------------- |
 | Playwright                        | CDP (own driver)                           | throwaway by default               | always               | always ("controlled by test software") | yes (webdriver flag, automation flags) |
 | Puppeteer                         | CDP                                        | throwaway by default               | always               | always                              | yes                       |
 | Selenium                          | WebDriver / BiDi                           | throwaway                          | partial (BiDi improves) | always                          | most detectable           |
 | puppeteer-stealth / playwright-extra | CDP + patches                           | throwaway                          | always               | always                              | medium (patches flags)    |
 | Raw CDP                           | direct devtools protocol                   | either (needs `--remote-debugging-port`) | always           | always                              | yes                       |
-| **pi-chrome**                     | **Chrome extension bridge → local loopback** | **your real Chrome profile, signed-in cookies, extensions, history** | **opt-in** (`/chrome clicks on` or `trusted: true`) | **only when trusted mode is active** | **synthetic mode bypasses common detection signals**¹ |
+| **pi-chrome**                     | **Chrome extension bridge → local loopback** | **your real Chrome profile, signed-in cookies, extensions, history** | **always for input tools** | **while Chrome input is attached** | **low (real profile + Chrome input)¹** |
 
-¹ pi-chrome synthetic mode dispatches DOM events with `isTrusted=false` — most sites don't check; some anti-bot defenses do. The [`test-suite/`](../test-suite) grades both modes against common detection signals. Trusted mode uses `chrome.debugger` and shows Chrome's banner like every other CDP-based tool.
+¹ pi-chrome uses `chrome.debugger` for browser input and shows Chrome's banner like other CDP-based tools. The [`test-suite/`](../test-suite) grades browser-control behavior against common detection signals.
 
 ### What makes pi-chrome different on this axis
 
 1. **Profile attach, not driver launch.** Every other driver fights cookie persistence, login walls, MFA, and extension state. pi-chrome inherits all of it because it *is* your Chrome.
-2. **Synthetic-first, trusted-on-demand.** Two-tier event model — agents pick the right tradeoff per call. Competitors are all-trusted (CDP) and always show the banner. pi-chrome avoids it by default; you opt in when a site needs it (autoplay gate, clipboard, file picker).
+2. **Chrome input against your real profile.** Interactive tools use CDP input for reliability while still controlling the Chrome profile you already use.
 3. **Extension bridge transport.** No `--remote-debugging-port`, no throwaway Chromium. Survives Chrome auto-updates. Works alongside your normal Chrome usage.
 4. **Honest result envelopes.** Every action returns `pageMutated`, `defaultPrevented`, `elementVisible`, `occludedBy`, `valueMatches`. Competitors return `void` or generic acks; agents loop blindly on broken clicks.
 5. **Multi-session shared bridge.** Planner + worker + audit Pi sessions all drive the same Chrome concurrently.
@@ -73,7 +73,7 @@ These wrap a driver with an LLM loop. They are **higher-level than pi-chrome** a
 | **OpenAI Operator**      | proprietary                    | OpenAI's own VLM + browser; ChatGPT-integrated.                                               | closed, hosted  |
 | **Project Mariner** (Google) | proprietary Chrome integration | Google's own VLM Chrome experiment.                                                       | closed          |
 | **Surfer 2 / Surfer-H** (H Company) | proprietary             | Hosted proprietary agent stack.                                                               | closed, hosted  |
-| **Anthropic Computer Use** | OS-level screenshots + mouse/keyboard | Broader than browser; trusted events at OS level.                                       | closed (API)    |
+| **Anthropic Computer Use** | OS-level screenshots + mouse/keyboard | Broader than browser; OS-level events.                                                 | closed (API)    |
 
 **Why pi-chrome is not on this list:** it's intentionally **not an agent**. There's no LLM loop, no `.act("click the blue button")`. Pi handles the loop; pi-chrome provides the primitives. This means:
 
@@ -126,7 +126,7 @@ Yes — you can export cookies and replay them, or point Playwright at your exis
 Different security boundary, not strictly safer.
 
 - **CDP-based tools** require `chrome --remote-debugging-port=...`. That port is unauthenticated and exposes the whole browser to any local process. Easy to misconfigure.
-- **pi-chrome** runs through an extension you install yourself with broad permissions (tabs, scripting, debugger, webNavigation). The bridge listens on `127.0.0.1:17318` loopback only. **Only install the bundled extension if you trust the source you got the npm package from.**
+- **pi-chrome** runs through an extension you install yourself with broad permissions (tabs, scripting, debugger, webNavigation). The bridge listens on `127.0.0.1:17318` loopback only, rejects browser-origin command requests, and keeps chrome_* tools locked until `/chrome authorize` is run in the current Pi session. **Only install the bundled extension if you trust the source you got the npm package from.**
 
 If your threat model excludes extensions with broad permissions, neither approach is a fit — you want a sandboxed CI runner.
 
@@ -134,7 +134,7 @@ If your threat model excludes extensions with broad permissions, neither approac
 
 ## Public benchmarks worth knowing (for axis 2 / axis 3 comparison)
 
-Pi-chrome itself ships a benchmark suite ([`../test-suite/`](../test-suite)) of **38 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks** covering trusted-input, pointer humanization, keyboard fidelity, drag/drop, Shadow DOM, file uploads, network observability, fingerprint leaks, and agent-safety honeypots. Scoring is **expected-outcome-by-mode** (not raw PASS count): each challenge has expected verdicts per mode (`synthetic` / `trusted` / `manual`) and a tool grades itself by whether its actual outcome matches expectations. That's **driver-level** grading.
+Pi-chrome itself ships a benchmark suite ([`../test-suite/`](../test-suite)) of **38 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks** covering real input, pointer humanization, keyboard fidelity, drag/drop, Shadow DOM, file uploads, network observability, fingerprint leaks, and agent-safety honeypots. Scoring tracks expected outcomes per challenge instead of raw PASS count. That's **driver-level** grading.
 
 For **agent-level** comparison (axis 2), the public benchmarks worth citing:
 
