@@ -1,7 +1,7 @@
 # pi-chrome
 
-> **The fastest way to give a [Pi](https://pi.dev) agent your real Chrome.**
-> No remote-debug port. No throwaway profile. No re-login. Watch it work — or run silent.
+> **Let a [Pi](https://pi.dev) agent use your existing signed-in Chrome profile.**
+> Explicitly authorize each Pi session. No throwaway browser, no re-login.
 
 **MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318`) · inspect [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading.** Verify connectivity in one command: `/chrome doctor`.
 
@@ -12,7 +12,7 @@ Agent:  chrome_tab(list) → chrome_snapshot(uid:…) → chrome_screenshot(...)
 You:    [keeps coding — agent never asked you to log in]
 ```
 
-`pi-chrome` ships **19 browser tools** for Pi agents, backed by a small MIT-licensed Chrome extension that runs inside the Chrome profile **you already use** — including every site you're already signed into.
+`pi-chrome` is backed by a small MIT-licensed Chrome extension that runs inside the Chrome profile **you already use** — including every site you're already signed into. Agents can inspect or control Chrome only after you run `/chrome authorize` in the current Pi session.
 
 ---
 

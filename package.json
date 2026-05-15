@@ -1,11 +1,11 @@
 {
 	"name": "pi-chrome",
-	"version": "0.15.17",
+	"version": "0.15.18",
 	"scripts": {
 		"version": "node scripts/sync-manifest-version.js",
 		"prepublishOnly": "node scripts/sync-manifest-version.js"
 	},
-	"description": "Give a Pi agent your real, signed-in Chrome. No remote-debug port, no throwaway profile, no re-login. 19 tools for click, type, navigate, screenshot, network capture, file upload, drag, and touch.",
+	"description": "Let Pi use your existing signed-in Chrome profile after explicit authorization. No throwaway browser, no re-login.",
 	"keywords": [
 		"pi",
 		"pi-package",
