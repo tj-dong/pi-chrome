@@ -1,7 +1,6 @@
 # pi-chrome
 
-> **Let a [Pi](https://pi.dev) agent use your existing signed-in Chrome profile.**
-> Explicitly authorize each Pi session. No throwaway browser, no re-login.
+> **Let [Pi](https://pi.dev) use your existing signed-in Chrome profile after explicit authorization.**
 
 **MIT · 0 runtime deps · loopback-only bridge (`127.0.0.1:17318`) · inspect [`extensions/chrome-profile-bridge/browser-extension/`](./extensions/chrome-profile-bridge/browser-extension) before loading.** Verify connectivity in one command: `/chrome doctor`.
 

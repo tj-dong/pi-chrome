@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.19 — 2026-05-14
+
+- **Simpler package description.** README hero and npm/pi.dev description now use the same concise authorization-focused sentence.
+
 ## 0.15.18 — 2026-05-14
 
 - **Cleaner package description.** npm/pi.dev description now focuses on the existing Chrome profile and explicit authorization model, avoiding implementation details.
