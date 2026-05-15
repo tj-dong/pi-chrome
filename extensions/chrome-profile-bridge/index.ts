@@ -684,6 +684,7 @@ Usage rules:
 	};
 
 	const statusHandler = async (ctx: ExtensionContext) => {
+		ctx.ui.notify("Checking Chrome connection…", "info");
 		ctx.ui.notify(await statusSummary(), "info");
 	};
 
@@ -723,6 +724,7 @@ Usage rules:
 
 	const openCommandMenu = async (ctx: ExtensionContext): Promise<void> => {
 		while (true) {
+			ctx.ui.notify("Checking Chrome connection…", "info");
 			const choice = await ctx.ui.select(`pi-chrome\n${await statusSummary()}`, [
 				"Authorize Chrome control…",
 				"Lock Chrome control",
