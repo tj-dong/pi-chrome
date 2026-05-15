@@ -419,8 +419,9 @@ function StringEnum<T extends readonly [string, ...string[]]>(values: T) {
 }
 
 export default function (pi: ExtensionAPI): void {
+	const instanceToken = Symbol("pi-chrome-instance");
 	const globalState = globalThis as typeof globalThis & {
-		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string };
+		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string; token: symbol };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
 	if (alreadyLoaded) {
@@ -429,7 +430,7 @@ export default function (pi: ExtensionAPI): void {
 		);
 		return;
 	}
-	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: extensionRoot() };
+	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: extensionRoot(), token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = false;
@@ -490,6 +491,9 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", () => {
 		bridge.stop();
+		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
+			delete globalState[PI_CHROME_GLOBAL_KEY];
+		}
 	});
 
 	pi.on("before_agent_start", (event) => {
