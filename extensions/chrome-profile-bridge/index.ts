@@ -895,6 +895,22 @@ class ChromeProfileBridge {
 		console.warn(`pi-chrome: killed PID ${pid}; will spawn the daemon next.`);
 	}
 
+	// Probe the daemon's /status and return its view (which is the only source of truth for
+	// `connected` / `lastSeenAt` in 0.17+, since the extension polls the daemon, not Pi).
+	async daemonStatus(timeoutMs = 1_000): Promise<Record<string, unknown> | undefined> {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			const res = await fetch(`${this.url}/status`, { signal: controller.signal });
+			if (!res.ok) return undefined;
+			return (await res.json()) as Record<string, unknown>;
+		} catch {
+			return undefined;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	// Signed admin RPC to the daemon. Used for state mutations the daemon owns: arm-pair-window,
 	// reset, status. Pre-pair (when the daemon has no state file), unauthenticated; once paired,
 	// the daemon requires the broker-key envelope (same signature as /command).
@@ -1453,7 +1469,7 @@ Usage rules:
 			// the doctor command for the full 35s waiting for a response that will never come.
 			if (!bridge.bridgeAuth.paired) {
 				lines.push("✗ Skipping extension probe — bridge isn't paired yet. Run /chrome onboard.");
-			} else if (!status.connected) {
+			} else if (!(await bridge.daemonStatus(1_500))?.connected) {
 				lines.push(
 					"✗ Chrome extension hasn't polled the bridge recently.",
 					"  Fix: load the extension via /chrome onboard, keep that Chrome window open, then re-run /chrome doctor.",
@@ -1744,11 +1760,13 @@ Usage rules:
 		// poll = lastSeenAt updates = `bridge.status().connected` flips true.
 		ctx.ui.notify("Waiting for the extension to wake up and poll the bridge…", "info");
 		const connectStart = Date.now();
+		let connected = false;
 		while (Date.now() - connectStart < 15_000) {
-			if (bridge.status().connected) break;
+			const ds = await bridge.daemonStatus(1_500);
+			if (ds && ds.connected === true) { connected = true; break; }
 			await new Promise((r) => setTimeout(r, 500));
 		}
-		if (!bridge.status().connected) {
+		if (!connected) {
 			ctx.ui.notify(
 				[
 					"✗ The Chrome extension didn't poll the bridge within 15 s.",
@@ -1837,7 +1855,8 @@ Usage rules:
 		if (!bridge.bridgeAuth.paired) {
 			return "✗ Chrome bridge not paired (run /chrome onboard)";
 		}
-		if (!bridge.status().connected) {
+		const ds = await bridge.daemonStatus(1_000);
+		if (!ds?.connected) {
 			return "✗ Chrome extension not polling (load extension via /chrome onboard, keep Chrome open)";
 		}
 		try {

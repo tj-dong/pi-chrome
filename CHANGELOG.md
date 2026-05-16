@@ -2,6 +2,20 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.17.1 — 2026-05-16
+
+### Fix: `/chrome onboard` stuck on "Waiting for the extension to wake up…"
+
+0.17.0 made the daemon (not the Pi process) own the HTTP listener, but the Pi client's
+`bridge.status().connected` still reflected the *local Pi*'s `lastSeenAt`, which never gets
+updated in the daemon model. Result: onboard's connect-wait loop spun forever even when the
+extension was happily polling the daemon.
+
+- New `ChromeProfileBridge.daemonStatus()` async method: fetches the daemon's `/status` and
+  returns its view (the only correct source of truth in 0.17+).
+- `/chrome onboard`, `/chrome doctor`, `/chrome status` now query `daemonStatus()` for the
+  `connected` flag instead of reading stale Pi-side `lastSeenAt`.
+
 ## 0.17.0 — 2026-05-16
 
 ### Standalone daemon (no more owner-vs-client topology)
