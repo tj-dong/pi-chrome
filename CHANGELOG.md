@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.22 — 2026-05-16
+
+- **Earlier page-load capture.** Companion extension now injects console/network instrumentation at `document_start`, so initial React render errors and early API calls show up in `chrome_list_console_messages` / `chrome_list_network_requests`.
+- **Quieter locked state.** Startup no longer shows a persistent Chrome bridge notification/status item before authorization; status bar appears only when Chrome control is authorized.
+- **Lazy tool registration.** `chrome_*` tools and primer are registered only after `/chrome authorize`, reducing prompt/tool overhead while Chrome control is locked.
+
 ## 0.15.21 — 2026-05-16
 
 ### Reverted 0.16.x and 0.17.x lines
