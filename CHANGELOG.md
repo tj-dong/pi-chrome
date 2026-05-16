@@ -2,6 +2,13 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.21 — 2026-05-16
+
+### Reverted 0.16.x and 0.17.x lines
+
+- Versions 0.16.0 through 0.17.2 were published to npm and subsequently unpublished. 0.17.3 was prepared locally but never published. The work introduced in those versions — mandatory pairing, signed-envelope auth, standalone bridge daemon, idempotent onboard, etc. — is reachable only via git tags (`v0.16.0` … `v0.17.3`) and is not in the current main branch.
+- This release is **tree-equivalent to 0.15.20** with a version-only bump so future patch releases can ship cleanly.
+
 ## 0.15.20 — 2026-05-15
 
 - **Interruptible `chrome_*` tools.** All `chrome_*` tools now honor the agent harness `AbortSignal`, so pressing Esc aborts in-flight bridge calls (including the long-polling `chrome_wait_for`) immediately instead of waiting out the full `timeoutMs`.
