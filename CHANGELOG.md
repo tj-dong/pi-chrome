@@ -2,6 +2,27 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.16.1 — 2026-05-16
+
+### Automatic stale-owner takeover at session_start
+
+- **`bridge.start()` auto-takes over when the existing owner is unresponsive or running an incompatible major.minor version.** Probes `/status` with a 1s timeout; if the response is missing or carries a `bridgeVersion` that doesn't match this pi-chrome's major.minor, locates the owner PID via `lsof`, kills it (SIGTERM → SIGKILL escalation), and re-binds. Same-version owners are still joined as clients (multi-Pi sharing). This makes pi-chrome upgrades self-healing: just `pi update` then start a new Pi session, no manual `kill` required.
+- **`/status` now includes `bridgeVersion`** so peer Pi sessions and tooling can make this decision deterministically.
+
+### Idempotent `/chrome onboard` recovery flow
+
+- **Foreign bridge-owner takeover.** When another Pi process (often an older pi-chrome that doesn't know about pairing) is holding `:17318`, onboard now detects it via `lsof`, confirms with the user, then `kill`s the foreign owner (SIGTERM → SIGKILL escalation), waits for the port to free, and re-binds the local bridge as server. Without this, onboarding from a peer Pi session would route through a stale owner forever.
+
+
+Real-world failure: users on machines with an older pi-chrome extension installed couldn't get back to a working state. Onboard trusted confirm() clicks without verifying anything, the bridge could be in a half-paired state if the extension was reloaded with empty `chrome.storage.local`, and `/chrome status` / `doctor` blocked for up to 35 s waiting for a response from an extension that wasn't polling.
+
+- **`/chrome onboard` (alias: `/chrome install`) is now safe to re-run any number of times.** Resets Pi-side pairing state first, walks the user through install OR reload (covering the v0.15.x → 0.16.x migration where the service worker must reload to gain the /pair logic), then **actively verifies** every step:
+  - polls `bridge.status().connected` (15 s window) to confirm the extension is actually polling `/next` before issuing a pair invite,
+  - polls `bridge.bridgeAuth.paired` after the user pastes the invite (no more "press Enter once it says paired" — detection is automatic),
+  - round-trips a real `tab.version` command to confirm the end-to-end signed-envelope path works.
+  - Any failure prints a concrete fix (wake the SW, re-load unpacked, switch to a normal tab, etc.).
+- **`/chrome status` / `doctor` / `onboard` no longer hang.** New `probeExtension()` short-circuits before any `bridge.send()` when the bridge is unpaired or the extension hasn't polled recently; commands return immediately with an actionable message instead of waiting the full 5–35 s timeout.
+
 ## 0.16.0 — 2026-05-16
 
 ### Onboarding UX (same release)

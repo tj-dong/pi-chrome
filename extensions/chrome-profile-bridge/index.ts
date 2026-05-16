@@ -4,6 +4,7 @@ import { existsSync, readFileSync, statSync, mkdirSync, writeFileSync, chmodSync
 import { mkdir, writeFile, readFile, chmod } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, createHmac, hkdfSync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -83,6 +84,56 @@ const MAX_WAITERS = 4;
 function isLoopbackAddress(address: string | undefined): boolean {
 	if (!address) return false;
 	return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+// Locate the OS-level owner of `:port` via `lsof`. Returns undefined when lsof isn't on
+// PATH (minimal Linux containers, Windows). Used by ChromeProfileBridge to decide whether
+// to auto-takeover an incompatible existing owner at session_start.
+function findPortOwnerPid(port: number): number | undefined {
+	try {
+		const result = spawnSync("sh", ["-lc", `lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null | head -1`], { timeout: 3_000, encoding: "utf8" });
+		if (result.status !== 0) return undefined;
+		const pid = Number(String(result.stdout).trim());
+		return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// Probe the owner's /status with a 1s timeout. Returns the parsed status object, or undefined
+// when the owner is unresponsive (likely dead/wedged). Synchronous fetch via a child process
+// avoids importing a fetch shim before the main event loop is up.
+function probeBridgeStatus(host: string, port: number): { bridgeVersion?: string } | undefined {
+	try {
+		const result = spawnSync("curl", ["-sS", "--max-time", "1", `http://${host}:${port}/status`], { timeout: 2_000, encoding: "utf8" });
+		if (result.status !== 0) return undefined;
+		return JSON.parse(String(result.stdout || "").trim() || "{}");
+	} catch {
+		return undefined;
+	}
+}
+
+function sameMajorMinor(a: string, b: string): boolean {
+	const [aMaj, aMin] = a.split(".").map((n) => Number(n));
+	const [bMaj, bMin] = b.split(".").map((n) => Number(n));
+	return aMaj === bMaj && aMin === bMin;
+}
+
+function killProcessGracefully(pid: number): boolean {
+	try { process.kill(pid, "SIGTERM"); } catch { return false; }
+	// Spin briefly waiting for the port to free; escalate to SIGKILL if SIGTERM is ignored.
+	const deadline = Date.now() + 3_000;
+	while (Date.now() < deadline) {
+		try { process.kill(pid, 0); } catch { return true; } // kill(pid, 0) throws ESRCH when gone
+		spawnSync("sleep", ["0.2"]);
+	}
+	try { process.kill(pid, "SIGKILL"); } catch {}
+	const secondDeadline = Date.now() + 2_000;
+	while (Date.now() < secondDeadline) {
+		try { process.kill(pid, 0); } catch { return true; }
+		spawnSync("sleep", ["0.2"]);
+	}
+	return false;
 }
 
 // =========================================================================================
@@ -703,11 +754,19 @@ class ChromeProfileBridge {
 			clientName: this.clientName,
 			queuedCommands: this.queue.length,
 			pendingCommands: this.pending.size,
+			// Version is broadcast in /status so peer Pi sessions can decide at session_start
+			// whether to join as client (compatible same major.minor) or to auto-takeover an
+			// older/wedged owner.
+			bridgeVersion: PI_CHROME_VERSION,
 		};
 	}
 
 	async start(): Promise<void> {
 		if (this.server || this.mode === "client") return;
+		await this.tryBind();
+	}
+
+	private async tryBind(): Promise<void> {
 		this.server = createServer((request, response) => {
 			void this.handle(request, response).catch((error) => {
 				sendJson(response, 500, { error: (error as Error).message });
@@ -726,8 +785,51 @@ class ChromeProfileBridge {
 			this.server.close();
 			this.server = undefined;
 			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-			// Another Pi session already owns the bridge port. Use it as the shared
-			// machine-local broker so multiple Pi sessions can control Chrome at once.
+			await this.handleEaddrinuse();
+		}
+	}
+
+	// Auto-takeover when the existing owner is unresponsive or running an incompatible
+	// version. Without this, a stale 0.15.x Pi process holding :17318 would block every new
+	// 0.16.x session from ever reaching the extension.
+	private async handleEaddrinuse(): Promise<void> {
+		const probed = probeBridgeStatus(this.host, this.port);
+		const ownerVersion = typeof probed?.bridgeVersion === "string" ? probed.bridgeVersion : undefined;
+		const compatible = ownerVersion ? sameMajorMinor(ownerVersion, PI_CHROME_VERSION) : false;
+		if (probed && compatible) {
+			// Healthy same-version owner. Share the bridge as a client; signed `/command` does
+			// the rest.
+			this.mode = "client";
+			return;
+		}
+		// Either no response at all, or the owner is on an incompatible (older or future)
+		// version that won't honor the same wire protocol. Try to take over.
+		const pid = findPortOwnerPid(this.port);
+		const reason = !probed
+			? "unresponsive"
+			: ownerVersion
+				? `version ${ownerVersion} incompatible with ${PI_CHROME_VERSION}`
+				: "unknown version";
+		if (!pid || pid === process.pid) {
+			console.warn(`pi-chrome: bridge port :${this.port} held by ${reason} owner; cannot identify PID via lsof. Falling back to client mode (commands may fail).`);
+			this.mode = "client";
+			return;
+		}
+		console.warn(`pi-chrome: bridge port :${this.port} held by PID ${pid} (${reason}); attempting takeover.`);
+		if (!killProcessGracefully(pid)) {
+			console.warn(`pi-chrome: failed to kill PID ${pid}; falling back to client mode.`);
+			this.mode = "client";
+			return;
+		}
+		// Port freed by the now-dead owner. Re-attempt the bind once. If it still fails (e.g.
+		// a third process grabbed the port between kill and listen), give up to client mode.
+		try {
+			await this.tryBind();
+			if (this.mode === "server") {
+				console.warn(`pi-chrome: took over bridge port :${this.port} from PID ${pid}.`);
+			}
+		} catch (error) {
+			console.warn(`pi-chrome: re-bind after takeover failed (${(error as Error).message}); falling back to client mode.`);
 			this.mode = "client";
 		}
 	}
@@ -1258,33 +1360,45 @@ Usage rules:
 			}
 			let extensionAlive = false;
 			let versionMismatch = false;
-			try {
-				const started = Date.now();
-				const version = (await bridge.send("tab.version", {}, 35_000)) as {
-					extensionId?: string;
-					extensionVersion?: string;
-					bridgeUrl?: string;
-				};
-				const latencyMs = Date.now() - started;
-				extensionAlive = true;
-				if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
-					versionMismatch = true;
-					lines.push(
-						`✗ The Chrome companion extension is on an old version (${version.extensionVersion}); this pi-chrome is ${PI_CHROME_VERSION}.`,
-						`  Every Chrome action will run with the old code until you reload the extension.`,
-						`  Fix: open chrome://extensions and click the refresh icon on 'Pi Chrome Connector'.`,
-						`  (After this one-time fix, future updates reload automatically.)`,
-					);
-				} else {
-					lines.push(`✓ Chrome is connected (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
-				}
-			} catch (error) {
-				const message = (error as Error).message;
-				lines.push(`✗ Chrome isn't responding: ${message}`);
-				if (message.includes("older pi-chrome without multi-session")) {
-					lines.push("  Fix: quit and restart the pi session that first opened the Chrome connection (it was on an older pi-chrome).");
-				} else {
-					lines.push("  Fix: run /chrome onboard to install the Chrome companion extension, then keep that Chrome window open.");
+			// Short-circuit when the bridge can't possibly round-trip: unpaired (commands never
+			// delivered) or no recent /next poll (extension absent/asleep). Otherwise we'd block
+			// the doctor command for the full 35s waiting for a response that will never come.
+			if (!bridge.bridgeAuth.paired) {
+				lines.push("✗ Skipping extension probe — bridge isn't paired yet. Run /chrome onboard.");
+			} else if (!status.connected) {
+				lines.push(
+					"✗ Chrome extension hasn't polled the bridge recently.",
+					"  Fix: load the extension via /chrome onboard, keep that Chrome window open, then re-run /chrome doctor.",
+				);
+			} else {
+				try {
+					const started = Date.now();
+					const version = (await bridge.send("tab.version", {}, 6_000)) as {
+						extensionId?: string;
+						extensionVersion?: string;
+						bridgeUrl?: string;
+					};
+					const latencyMs = Date.now() - started;
+					extensionAlive = true;
+					if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
+						versionMismatch = true;
+						lines.push(
+							`✗ The Chrome companion extension is on an old version (${version.extensionVersion}); this pi-chrome is ${PI_CHROME_VERSION}.`,
+							`  Every Chrome action will run with the old code until you reload the extension.`,
+							`  Fix: open chrome://extensions and click the refresh icon on 'Pi Chrome Connector'.`,
+							`  (After this one-time fix, future updates reload automatically.)`,
+						);
+					} else {
+						lines.push(`✓ Chrome is connected (companion extension v${version.extensionVersion ?? "?"}, responded in ${latencyMs}ms).`);
+					}
+				} catch (error) {
+					const message = (error as Error).message;
+					lines.push(`✗ Chrome isn't responding: ${message}`);
+					if (message.includes("older pi-chrome without multi-session")) {
+						lines.push("  Fix: quit and restart the pi session that first opened the Chrome connection (it was on an older pi-chrome).");
+					} else {
+						lines.push("  Fix: re-run /chrome onboard, or reload 'Pi Chrome Connector' at chrome://extensions and keep that Chrome window open.");
+					}
 				}
 			}
 
@@ -1435,6 +1549,50 @@ Usage rules:
 		ctx.ui.notify("pi-chrome unpaired. Run /chrome pair to start a new pairing.", "info");
 	};
 
+	// Locate the OS-level owner of the bridge listener via `lsof`. Used by /chrome onboard to
+	// detect an older pi-chrome process still holding `:17318` that won't honor the new
+	// pairing protocol. macOS + most Linux distros ship `lsof`; if it isn't available we
+	// return undefined and the caller falls back to printing instructions for the user.
+	const findBridgeOwnerPid = async (ctx: ExtensionContext): Promise<number | undefined> => {
+		if (process.platform === "win32") return undefined;
+		try {
+			const { stdout } = await pi.exec("sh", ["-lc", `lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN -t 2>/dev/null | head -1`], { cwd: workspaceCwd(ctx), timeout: 3_000 });
+			const pid = Number(String(stdout).trim());
+			return Number.isFinite(pid) && pid > 0 ? pid : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+
+	// Kill the foreign owner (TERM then KILL), wait for the port to actually free, then
+	// take it over by stop()/start()ing the local bridge. Returns true on success.
+	const takeOverBridgePort = async (ctx: ExtensionContext, ownerPid: number): Promise<boolean> => {
+		await pi.exec("sh", ["-lc", `kill ${ownerPid} 2>/dev/null || true`], { cwd: workspaceCwd(ctx), timeout: 3_000 }).catch(() => undefined);
+		// SIGTERM first; if the process hasn't released the port within ~3s, escalate.
+		for (let i = 0; i < 12; i++) {
+			const still = await findBridgeOwnerPid(ctx);
+			if (!still || still !== ownerPid) break;
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		const stillAfterTerm = await findBridgeOwnerPid(ctx);
+		if (stillAfterTerm === ownerPid) {
+			await pi.exec("sh", ["-lc", `kill -9 ${ownerPid} 2>/dev/null || true`], { cwd: workspaceCwd(ctx), timeout: 3_000 }).catch(() => undefined);
+			for (let i = 0; i < 12; i++) {
+				const still = await findBridgeOwnerPid(ctx);
+				if (!still || still !== ownerPid) break;
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		}
+		const stillFinal = await findBridgeOwnerPid(ctx);
+		if (stillFinal === ownerPid) return false;
+		// Port should now be free (or a different process picked it up; either way our previous
+		// owner is gone). Drop client-mode and re-bind as server. bridge.start() handles
+		// EADDRINUSE again if some unrelated process grabbed the port between kill and listen.
+		bridge.stop();
+		await bridge.start();
+		return bridge.status().mode === "server";
+	};
+
 	const copyToClipboard = async (ctx: ExtensionContext, text: string): Promise<void> => {
 		if (process.platform === "darwin") {
 			await pi.exec("sh", ["-lc", `printf %s ${JSON.stringify(text)} | pbcopy`], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
@@ -1443,134 +1601,263 @@ Usage rules:
 		}
 	};
 
-	// `/chrome onboard` walks the user end-to-end through the only setup that matters: install
-	// the Chrome extension, then pair it with this Pi bridge. Pairing was previously a separate
-	// `/chrome pair` step that users frequently forgot, so we inline it here. Returning users
-	// who only need to re-install the extension can skip the pair step when prompted; users who
-	// only need to re-pair an already-installed extension can call `/chrome pair` directly.
+	// `/chrome onboard` (aliased as `/chrome install`) is the idempotent recovery path. It can
+	// be re-run any number of times to bring a broken machine back to a known-good state,
+	// regardless of what older versions of pi-chrome left behind:
+	//
+	//   * It always resets the Pi-side pairing record before issuing a new invite, so a stale
+	//     `~/.config/pi/chrome-bridge.json` (e.g. paired against an old extension instance whose
+	//     keys were never persisted in Chrome's storage) cannot silently keep the bridge in a
+	//     half-paired state.
+	//   * It opens chrome://extensions + the extension folder and tells the user to either Load
+	//     unpacked (first install) OR click the reload icon on the existing card (covers the
+	//     v0.15.x → 0.16.x migration where the SW must be re-loaded to gain the /pair logic).
+	//   * It then **actively verifies** progress at each step rather than trusting confirm()
+	//     clicks: it polls `bridge.status().connected` to confirm the extension is polling
+	//     `/next`, polls `bridge.bridgeAuth.paired` to confirm the popup successfully completed
+	//     the /pair handshake, and finally round-trips a real `tab.version` call to confirm the
+	//     end-to-end signed-envelope path works.
+	//
+	// If any of those steps fail, it prints a concrete fix and stops; rerunning is always safe.
 	const onboardHandler = async (ctx: ExtensionContext) => {
-		if (bridge.status().mode === "client") {
+		// Note: we deliberately do NOT early-return on client mode here. Onboarding is precisely
+		// the recovery path for the case where a foreign Pi process owns the bridge — the Step 0
+		// foreign-owner takeover below will kill that process and re-bind locally.
+		const extensionPath = browserExtensionPath();
+
+		const proceed = await ctx.ui.confirm(
+			"pi-chrome onboard",
+			[
+				"This will set up Chrome control from scratch:",
+				"  1. Reset any stale pairing state on the Pi side.",
+				"  2. Walk you through (re-)loading the Chrome extension.",
+				"  3. Mint a fresh pairing invite and wait for you to paste it into the popup.",
+				"  4. Verify a real Chrome round-trip works.",
+				"",
+				"Safe to re-run any time; nothing else changes.",
+				"",
+				"Press Enter to continue, or Esc to cancel.",
+			].join("\n"),
+		);
+		if (!proceed) {
+			ctx.ui.notify("Cancelled. Run /chrome onboard again whenever you're ready.", "info");
+			return;
+		}
+
+		// --- Step 0: deal with a foreign bridge owner. -----------------------------------
+		// If another Pi process owns :17318, our local bridge is in client mode and forwards
+		// every command through that owner. If the owner is on an older pi-chrome (no /pair,
+		// no signed envelopes), the whole flow fails silently. Detect it and offer to kill
+		// the foreign owner so this session can take over.
+		const ownerPid = await findBridgeOwnerPid(ctx);
+		if (bridge.status().mode === "client" && (!ownerPid || ownerPid === process.pid)) {
+			// Fallback when `lsof` isn't available (e.g. minimal Linux container): we know we're
+			// a client but can't locate the owner to kill it. Surface a clear instruction.
 			ctx.ui.notify(
-				"This Pi session is sharing another session's Chrome bridge. Run /chrome onboard from the Pi session that owns the bridge (the first one started in this cwd).",
+				[
+					`This Pi session is in client mode (another Pi process owns :${DEFAULT_PORT}), but pi-chrome can't locate the owner via lsof on this platform.`,
+					`Manually identify and kill it, then re-run /chrome onboard:`,
+					`  lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN`,
+					`  kill <pid>`,
+				].join("\n"),
 				"warning",
 			);
 			return;
 		}
-		const extensionPath = browserExtensionPath();
-
-		// --- Step 1: install / reload the Chrome extension. -------------------------------
-		const alreadyConnected = await bridge.send("tab.version", {}, 3_000).then(() => true).catch(() => false);
-		let installStep: "install" | "skip" = "install";
-		if (alreadyConnected) {
-			const keep = await ctx.ui.confirm(
-				"Chrome extension already connected",
-				"Skip the install step and jump straight to pairing? (Press Esc to re-install the extension instead.)",
-			);
-			if (keep) installStep = "skip";
-		}
-
-		if (installStep === "install") {
-			const proceed = await ctx.ui.confirm(
-				"Step 1 of 2: install the Chrome extension",
+		if (ownerPid && ownerPid !== process.pid) {
+			const kill = await ctx.ui.confirm(
+				`Another Pi process owns the Chrome bridge (PID ${ownerPid})`,
 				[
-					`pi-chrome will open Chrome's extensions page and reveal the extension folder in Finder.`,
+					`A different Pi process is currently listening on :${DEFAULT_PORT}. If it's running an older pi-chrome it doesn't know about pairing, and onboarding from this session won't reach the extension.`,
 					``,
-					`In Chrome:`,
-					`  1. Turn on 'Developer mode' (top-right toggle).`,
-					`  2. Click 'Load unpacked' and pick the folder that opens in Finder, or paste this path (it's on your clipboard):`,
-					`     ${extensionPath}`,
+					`pi-chrome will kill PID ${ownerPid} and have this Pi session take over the bridge.`,
 					``,
-					`Press Enter to continue, or Esc to cancel.`,
+					`Press Enter to kill it, or Esc to abort.`,
 				].join("\n"),
 			);
-			if (!proceed) {
-				ctx.ui.notify("Cancelled. Run /chrome onboard again whenever you're ready.", "info");
+			if (!kill) {
+				ctx.ui.notify("Cancelled. Re-run /chrome onboard when ready, or manually `kill` the older Pi process holding the port.", "info");
 				return;
 			}
-			if (process.platform === "darwin") {
-				await pi.exec("open", ["-a", "Google Chrome", "chrome://extensions"], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
-				await pi.exec("open", ["-R", extensionPath], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
-			}
-			await copyToClipboard(ctx, extensionPath);
-			ctx.ui.notify(
-				"Chrome and Finder should be open; the extension folder path is on your clipboard. After Chrome shows 'Pi Chrome Connector', press Enter to continue.",
-				"info",
-			);
-			const ready = await ctx.ui.confirm(
-				"Extension loaded?",
-				"Confirm once 'Pi Chrome Connector' appears in chrome://extensions. Press Esc to abort if it didn't load.",
-			);
-			if (!ready) {
-				ctx.ui.notify("Cancelled before pairing. Run /chrome onboard again, or /chrome pair if you load the extension later.", "info");
+			ctx.ui.notify(`Killing PID ${ownerPid} and taking over :${DEFAULT_PORT}…`, "info");
+			const took = await takeOverBridgePort(ctx, ownerPid);
+			if (!took) {
+				ctx.ui.notify(
+					[
+						`✗ Could not take over the bridge from PID ${ownerPid}.`,
+						`  Either the process didn't release the port, or another process grabbed it immediately.`,
+						`  Inspect with: lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN`,
+						`  Then re-run /chrome onboard.`,
+					].join("\n"),
+					"warning",
+				);
 				return;
 			}
+			ctx.ui.notify(`✓ This Pi session now owns the Chrome bridge on :${DEFAULT_PORT}.`, "info");
 		}
 
-		// --- Step 2: pair. ---------------------------------------------------------------
-		if (bridge.bridgeAuth.paired) {
-			const rePair = await ctx.ui.confirm(
-				"Bridge is already paired",
-				"Re-pair with this freshly-installed extension? The previous pairing will be invalidated and any other Pi sessions sharing this bridge will need /chrome authorize again.\n\nPress Enter to re-pair, Esc to keep the existing pairing.",
+		// --- Step 1: reset Pi-side state. ------------------------------------------------
+		// Always clears `~/.config/pi/chrome-bridge.json`. Any cached extension keys in
+		// chrome.storage.local will become invalid, but that's fine because we're about to
+		// mint a fresh invite and re-pair. The popup's auto-poll will surface 'unpaired'
+		// immediately because of the fs.watch + refreshIfStale plumbing on the bridge.
+		const hadPriorPairing = bridge.bridgeAuth.paired;
+		bridge.bridgeAuth.reset();
+		if (hadPriorPairing) {
+			ctx.ui.notify(
+				"Cleared the previous pairing record. The extension popup may still show 'Paired' until it polls again; that's fine — we'll re-pair below.",
+				"info",
 			);
-			if (!rePair) {
-				ctx.ui.notify("Kept existing pairing. Run /chrome authorize to allow chrome_* tools.", "info");
-				return;
-			}
-			bridge.bridgeAuth.reset();
 		}
+
+		// --- Step 2: install or reload the Chrome extension. -----------------------------
+		if (process.platform === "darwin") {
+			await pi.exec("open", ["-a", "Google Chrome", "chrome://extensions"], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+			await pi.exec("open", ["-R", extensionPath], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+		}
+		await copyToClipboard(ctx, extensionPath);
+		ctx.ui.notify(
+			[
+				"Step 1 of 3 — install or reload the Chrome extension",
+				"",
+				"Open chrome://extensions. Two cases:",
+				"",
+				"  A. If 'Pi Chrome Connector' is NOT listed:",
+				"     • Toggle Developer mode (top-right).",
+				"     • Click 'Load unpacked'.",
+				`     • Pick the folder that just opened in Finder, or paste this path (it's on your clipboard):`,
+				`         ${extensionPath}`,
+				"",
+				"  B. If 'Pi Chrome Connector' IS listed:",
+				"     • Click the refresh (↻) icon on its card so the service worker reloads with the current code.",
+				"",
+				"Press Enter once the extension card shows 'Pi Chrome Connector' (recent load time).",
+			].join("\n"),
+			"info",
+		);
+		const ready = await ctx.ui.confirm(
+			"Extension loaded / reloaded?",
+			"Confirm once Pi Chrome Connector is listed and active. Press Esc to abort.",
+		);
+		if (!ready) {
+			ctx.ui.notify("Cancelled before pairing. Re-run /chrome onboard whenever ready.", "info");
+			return;
+		}
+
+		// --- Step 2.5: wait for the SW to start polling /next. ---------------------------
+		// Without this gate, a paused service worker (or an extension that didn't actually
+		// reload) lets the user proceed to step 3 only to have pairing silently fail. Active
+		// poll = lastSeenAt updates = `bridge.status().connected` flips true.
+		ctx.ui.notify("Waiting for the extension to wake up and poll the bridge…", "info");
+		const connectStart = Date.now();
+		while (Date.now() - connectStart < 15_000) {
+			if (bridge.status().connected) break;
+			await new Promise((r) => setTimeout(r, 500));
+		}
+		if (!bridge.status().connected) {
+			ctx.ui.notify(
+				[
+					"✗ The Chrome extension didn't poll the bridge within 15 s.",
+					"  Common causes:",
+					"    • Service worker is suspended. Open chrome://extensions → 'service worker' link on the Pi Chrome Connector card to wake it.",
+					"    • The extension didn't load (folder permission, wrong path). Try Load unpacked again with the path on your clipboard.",
+					"    • The extension is disabled. Toggle it on.",
+					"",
+					"  Fix and re-run /chrome onboard — it's idempotent.",
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+		ctx.ui.notify("✓ Extension is polling.", "info");
+
+		// --- Step 3: mint invite, wait for the popup to complete the /pair handshake. ----
 		const invite = bridge.bridgeAuth.startPairWindow();
 		await copyToClipboard(ctx, invite);
 		ctx.ui.notify(
 			[
-				"Step 2 of 2: pair the extension with this Pi bridge.",
+				"Step 2 of 3 — pair the extension with this bridge",
 				"",
-				"  1. Click the Pi Chrome Connector icon in Chrome's toolbar (the puzzle piece, then pin it if needed).",
+				"  1. Click the Pi Chrome Connector icon in Chrome's toolbar (puzzle-piece menu, pin it if needed).",
 				"  2. Paste the invite below into the popup and click 'Pair'.",
 				"",
 				`  Invite (also on your clipboard):  ${invite}`,
 				"",
-				`  Expires in ${Math.round(PAIR_WINDOW_MS / 60_000)} minutes.`,
+				`  Window: ${Math.round(PAIR_WINDOW_MS / 60_000)} min. Pi will detect the pair automatically; you don't need to press anything here.`,
 			].join("\n"),
 			"info",
 		);
-		const paired = await ctx.ui.confirm(
-			"Wait for pairing",
-			"Press Enter once the extension popup says 'Paired with bridge …'. Press Esc to abort — invite stays armed for the rest of the window so you can call /chrome pair later.",
-		);
-		if (!paired) {
-			ctx.ui.notify("Onboarding paused. Invite is still armed; run /chrome pair or paste again later.", "info");
-			return;
+		const pairStart = Date.now();
+		while (Date.now() - pairStart < PAIR_WINDOW_MS) {
+			if (bridge.bridgeAuth.paired) break;
+			await new Promise((r) => setTimeout(r, 500));
 		}
 		if (!bridge.bridgeAuth.paired) {
+			ctx.ui.notify("✗ Pairing window expired with no /pair from the extension. Re-run /chrome onboard.", "warning");
+			return;
+		}
+		ctx.ui.notify("✓ Bridge paired with the extension.", "info");
+
+		// --- Step 4: verify a real round-trip. -------------------------------------------
+		try {
+			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string };
+			ctx.ui.notify(`✓ Step 3 of 3 — Chrome round-trip OK (extension v${version.extensionVersion ?? "?"}).`, "info");
+		} catch (error) {
 			ctx.ui.notify(
-				"Pi side still shows the bridge as unpaired. The invite may not have been pasted yet, or the extension may not be loaded. Re-run /chrome onboard, or run /chrome doctor for diagnostics.",
+				[
+					`⚠ Pairing succeeded but a test round-trip failed: ${(error as Error).message}`,
+					"  Possible causes:",
+					"    • Chrome was switched to a chrome:// or chrome-extension:// tab; pi-chrome can't run there. Switch to a normal http(s) tab and run /chrome doctor.",
+					"    • Service worker went back to sleep between pair and probe. Click the extension icon once and re-run /chrome doctor.",
+				].join("\n"),
 				"warning",
 			);
 			return;
 		}
+
 		ctx.ui.notify(
-			"✓ Pairing complete. Next step: run /chrome authorize 15m (or longer) before using chrome_* tools.",
+			"All set. Run /chrome authorize 15m (or longer) before using chrome_* tools.",
 			"info",
 		);
+	};
+
+	// `probeExtension` short-circuits before issuing a bridge.send when we already know the
+	// command can't round-trip, so /chrome status / doctor / onboard don't block for the full
+	// timeout. Returns a single line summarising the result.
+	//
+	// Order of checks:
+	//   1. Bridge unpaired — no command will ever be delivered (/next returns idle), so don't
+	//      bother sending. Tell the user to run /chrome onboard.
+	//   2. Extension hasn't polled /next recently — the bridge has no live connection. Skip the
+	//      send and report disconnected immediately.
+	//   3. Otherwise probe with a short timeout (paired + recent /next means a round-trip
+	//      should complete in <1s; 3s is plenty).
+	const probeExtension = async (timeoutMs = 3_000): Promise<string> => {
+		if (!bridge.bridgeAuth.paired) {
+			return "✗ Chrome bridge not paired (run /chrome onboard)";
+		}
+		if (!bridge.status().connected) {
+			return "✗ Chrome extension not polling (load extension via /chrome onboard, keep Chrome open)";
+		}
+		try {
+			const version = (await bridge.send("tab.version", {}, timeoutMs)) as { extensionVersion?: string };
+			if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
+				return `⚠ Chrome extension v${version.extensionVersion} (pi-chrome v${PI_CHROME_VERSION}, reload extension)`;
+			}
+			return `✓ Chrome connected`;
+		} catch {
+			return `✗ Chrome not responding within ${timeoutMs}ms`;
+		}
 	};
 
 	// One-line snapshot of pi-chrome's current state. Used as a header in the bare-/chrome
 	// picker and as the body of /chrome status.
 	const statusSummary = async (): Promise<string> => {
-		const parts: string[] = [];
-		try {
-			const version = (await bridge.send("tab.version", {}, 5_000)) as { extensionVersion?: string };
-			if (version.extensionVersion && version.extensionVersion !== PI_CHROME_VERSION) {
-				parts.push(`⚠ Chrome extension v${version.extensionVersion} (pi-chrome v${PI_CHROME_VERSION}, reload extension)`);
-			} else {
-				parts.push(`✓ Chrome connected`);
-			}
-		} catch {
-			parts.push(`✗ Chrome not responding`);
-		}
-		parts.push(`auth: ${authSummary()}`);
-		parts.push(`background: ${backgroundDefault ? "on" : "off"}`);
-		return parts.join(" · ");
+		return [
+			await probeExtension(2_000),
+			`auth: ${authSummary()}`,
+			`background: ${backgroundDefault ? "on" : "off"}`,
+		].join(" · ");
 	};
 
 	const statusHandler = async (ctx: ExtensionContext) => {
@@ -1635,7 +1922,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n\n  First-time setup (do these once, in this order):\n    /chrome onboard  — install the Chrome extension AND pair it with this Pi bridge.\n    /chrome authorize [15m|30m|<minutes>|indefinite] — unlock chrome_* tools for this Pi session.\n\n  Day-to-day:\n    /chrome authorize — unlock chrome_* tools (per session).\n    /chrome revoke    — lock chrome_* tools again.\n    /chrome status    — one-line snapshot of connection, auth, and background setting.\n    /chrome doctor    — full health check; tells you exactly what's missing.\n\n  Maintenance (rare):\n    /chrome pair      — (re-)pair the extension when only pairing is missing.\n    /chrome unpair    — clear pairing keys; every Pi session will need to re-pair.\n    /chrome background [on|off|status|toggle] — run without focusing Chrome.\n\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n\n  First-time setup (do these once, in this order):\n    /chrome onboard  — idempotent: install/reload the Chrome extension AND pair it with this Pi bridge. Safe to re-run any time — it'll bring a broken machine back to a known-good state.\n    /chrome install  — alias for /chrome onboard.\n    /chrome authorize [15m|30m|<minutes>|indefinite] — unlock chrome_* tools for this Pi session.\n\n  Day-to-day:\n    /chrome authorize — unlock chrome_* tools (per session).\n    /chrome revoke    — lock chrome_* tools again.\n    /chrome status    — one-line snapshot of connection, auth, and background setting.\n    /chrome doctor    — full health check; tells you exactly what's missing.\n\n  Maintenance (rare):\n    /chrome pair      — (re-)pair the extension when only pairing is missing.\n    /chrome unpair    — clear pairing keys; every Pi session will need to re-pair.\n    /chrome background [on|off|status|toggle] — run without focusing Chrome.\n\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -1652,7 +1939,8 @@ Usage rules:
 			let candidates: Item[] = [];
 			if (path.length === 0) {
 				candidates = [
-					{ fullValue: "onboard", label: "onboard", description: "First-time setup: install the Chrome extension + pair it (run this once, then /chrome authorize)." },
+					{ fullValue: "onboard", label: "onboard", description: "Idempotent recovery flow: install/reload extension + (re-)pair + verify round-trip. Safe to re-run anytime." },
+					{ fullValue: "install", label: "install", description: "Alias for /chrome onboard." },
 					{ fullValue: "authorize", label: "authorize", description: "Unlock chrome_* tools for this Pi session." },
 					{ fullValue: "revoke", label: "revoke", description: "Lock chrome_* tools again." },
 					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
@@ -1691,6 +1979,7 @@ Usage rules:
 			switch (head) {
 				case "pair": return pairHandler(ctx);
 				case "unpair": return unpairHandler(ctx);
+				case "install": return onboardHandler(ctx);
 				case "authorize": return authorizeHandler(ctx, subArgs);
 				case "revoke": return revokeHandler(ctx);
 				case "status": return statusHandler(ctx);
