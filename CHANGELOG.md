@@ -2,6 +2,13 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.17.2 — 2026-05-16
+
+### Fixes for the daemon model surfaced during 0.17.0/0.17.1 testing
+
+- **Daemon: record `lastSeenAt` on *every* `/next` from a chrome-extension origin**, not only after the paired-auth checks. Pre-pairing the daemon returns `needsPairing: true` early; before this fix it never updated `lastSeenAt`, so the daemon's `connected` flag stayed `false` even when the extension was happily polling. `/chrome onboard` would loop forever on "Waiting for the extension to wake up…" even with a perfectly healthy extension.
+- **Daemon compatibility is now checked at exact version match**, not just major.minor. Without this, a 0.17.x patch release that fixes a daemon bug couldn't actually replace the running 0.17.0 daemon — the new Pi client would `sameMajorMinor`-match the old daemon and join as client, never triggering a respawn. Patch releases now auto-kill+respawn the daemon, so daemon bug fixes ship cleanly via `pi update`.
+
 ## 0.17.1 — 2026-05-16
 
 ### Fix: `/chrome onboard` stuck on "Waiting for the extension to wake up…"

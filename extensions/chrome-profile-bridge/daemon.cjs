@@ -569,6 +569,14 @@ async function handle(req, res) {
 		if (!isBrowserOriginAllowed(req)) { sendJson(res, 403, { ok: false, error: "browser origin not allowed" }); return; }
 		const originExt = extensionIdFromOrigin(req);
 		const currentVersion = ARGS.version;
+		// Any /next from a chrome-extension origin counts as 'extension is alive'. We record
+		// lastSeenAt here — before the auth/pair checks below — so that /chrome onboard's
+		// connect-wait loop can detect a polling-but-unpaired extension (which is precisely
+		// the state during the pair step).
+		if (originExt) {
+			lastSeenAt = Date.now();
+			clientName = url.searchParams.get("name") ?? undefined;
+		}
 		if (!auth.paired) {
 			sendJson(res, 200, { type: "none", needsPairing: true, expectedExtensionVersion: currentVersion },
 				{ ...corsHeaders, "x-pi-chrome-version": currentVersion });
@@ -590,8 +598,6 @@ async function handle(req, res) {
 			return;
 		}
 		if (waiters.length >= MAX_WAITERS) { sendJson(res, 429, { ok: false, error: "too many pollers" }, corsHeaders); return; }
-		lastSeenAt = Date.now();
-		clientName = url.searchParams.get("name") ?? undefined;
 		let aborted = false;
 		let active;
 		req.once("close", () => { aborted = true; if (active) waiters = waiters.filter((e) => e !== active); });

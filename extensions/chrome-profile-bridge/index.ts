@@ -114,10 +114,12 @@ function probeBridgeStatus(host: string, port: number): { bridgeVersion?: string
 	}
 }
 
-function sameMajorMinor(a: string, b: string): boolean {
-	const [aMaj, aMin] = a.split(".").map((n) => Number(n));
-	const [bMaj, bMin] = b.split(".").map((n) => Number(n));
-	return aMaj === bMaj && aMin === bMin;
+// Daemon compat is checked at exact version match — not major.minor — so that even patch
+// releases trigger an automatic kill+respawn. Patch releases routinely fix bugs in the daemon
+// itself (e.g. /next lastSeenAt handling); without exact matching, a new Pi client joins an
+// old buggy daemon and the fix never lands.
+function daemonVersionCompatible(daemonVersion: string, clientVersion: string): boolean {
+	return daemonVersion === clientVersion;
 }
 
 // Ensure the bundled daemon.cjs is copied to a versioned cache dir so each pi-chrome
@@ -178,7 +180,7 @@ function waitForDaemonReady(host: string, port: number, timeoutMs = 4_000): Reco
 	while (Date.now() < deadline) {
 		const probed = probeBridgeStatus(host, port);
 		if (probed && typeof (probed as { bridgeVersion?: string }).bridgeVersion === "string"
-			&& sameMajorMinor((probed as { bridgeVersion: string }).bridgeVersion, PI_CHROME_VERSION)) {
+			&& daemonVersionCompatible((probed as { bridgeVersion: string }).bridgeVersion, PI_CHROME_VERSION)) {
 			return probed;
 		}
 		spawnSync("sleep", ["0.1"]);
@@ -844,7 +846,7 @@ class ChromeProfileBridge {
 		const ownerVersion = typeof (probed as { bridgeVersion?: string })?.bridgeVersion === "string"
 			? (probed as { bridgeVersion: string }).bridgeVersion
 			: undefined;
-		const compatible = ownerVersion ? sameMajorMinor(ownerVersion, PI_CHROME_VERSION) : false;
+		const compatible = ownerVersion ? daemonVersionCompatible(ownerVersion, PI_CHROME_VERSION) : false;
 		if (probed && compatible) {
 			this.mode = "client";
 			return;
@@ -868,7 +870,7 @@ class ChromeProfileBridge {
 	private async handleEaddrinuse(): Promise<void> {
 		const probed = probeBridgeStatus(this.host, this.port);
 		const ownerVersion = typeof probed?.bridgeVersion === "string" ? probed.bridgeVersion : undefined;
-		const compatible = ownerVersion ? sameMajorMinor(ownerVersion, PI_CHROME_VERSION) : false;
+		const compatible = ownerVersion ? daemonVersionCompatible(ownerVersion, PI_CHROME_VERSION) : false;
 		if (probed && compatible) {
 			this.mode = "client";
 			return;
