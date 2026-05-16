@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.24 — 2026-05-16
+
+- **Unload Chrome tools on lock.** `chrome_*` tools now deactivate when `/chrome revoke` runs or timed authorization expires, keeping the prompt/tool list small after Chrome control locks again.
+
 ## 0.15.23 — 2026-05-16
 
 - **Attribution.** The 0.15.22 features below are pulled from Dani Bednarski's fork (`DaniBedz/pi-chrome`). Thank you, Dani.

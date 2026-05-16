@@ -441,6 +441,28 @@ class ChromeProfileBridge {
 const tabActionValues = ["list", "new", "activate", "close", "version"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
+const CHROME_TOOL_NAMES = [
+	"chrome_launch",
+	"chrome_tab",
+	"chrome_snapshot",
+	"chrome_navigate",
+	"chrome_evaluate",
+	"chrome_click",
+	"chrome_type",
+	"chrome_fill",
+	"chrome_key",
+	"chrome_wait_for",
+	"chrome_list_console_messages",
+	"chrome_list_network_requests",
+	"chrome_get_network_request",
+	"chrome_screenshot",
+	"chrome_hover",
+	"chrome_drag",
+	"chrome_tap",
+	"chrome_scroll",
+	"chrome_upload_file",
+] as const;
+const CHROME_TOOL_NAME_SET = new Set<string>(CHROME_TOOL_NAMES);
 
 function StringEnum<T extends readonly [string, ...string[]]>(values: T) {
 	return Type.Union(values.map((value) => Type.Literal(value)) as [ReturnType<typeof Type.Literal>, ...ReturnType<typeof Type.Literal>[]]);
@@ -464,6 +486,30 @@ export default function (pi: ExtensionAPI): void {
 	let backgroundDefault = false;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	let chromeToolsRegistered = false;
+	let authExpiryTimer: NodeJS.Timeout | undefined;
+
+	const clearAuthExpiryTimer = (): void => {
+		if (!authExpiryTimer) return;
+		clearTimeout(authExpiryTimer);
+		authExpiryTimer = undefined;
+	};
+
+	const activeToolNamesWithoutChrome = (): string[] => pi.getActiveTools().filter((name) => !CHROME_TOOL_NAME_SET.has(name));
+
+	const activateChromeTools = (): void => {
+		registerChromeTools(pi);
+		pi.setActiveTools([...new Set([...pi.getActiveTools(), ...CHROME_TOOL_NAMES])]);
+	};
+
+	const deactivateChromeTools = (): void => {
+		pi.setActiveTools(activeToolNamesWithoutChrome());
+	};
+
+	const lockChromeControl = (): void => {
+		clearAuthExpiryTimer();
+		chromeAuthorizedUntil = undefined;
+		deactivateChromeTools();
+	};
 
 	const authSummary = (): string => {
 		if (chromeAuthorizedUntil === "indefinite") return "authorized indefinitely";
@@ -477,7 +523,7 @@ export default function (pi: ExtensionAPI): void {
 	const chromeControlAuthorized = (): boolean => {
 		if (chromeAuthorizedUntil === "indefinite") return true;
 		if (typeof chromeAuthorizedUntil === "number" && chromeAuthorizedUntil > Date.now()) return true;
-		chromeAuthorizedUntil = undefined;
+		if (chromeAuthorizedUntil !== undefined) lockChromeControl();
 		return false;
 	};
 
@@ -493,6 +539,21 @@ export default function (pi: ExtensionAPI): void {
 		} else {
 			ctx.ui.setStatus("chrome", undefined);
 		}
+	};
+
+	const scheduleAuthExpiry = (ctx: ExtensionContext, until: number | "indefinite"): void => {
+		clearAuthExpiryTimer();
+		if (until === "indefinite") return;
+		authExpiryTimer = setTimeout(() => {
+			if (chromeAuthorizedUntil !== until) return;
+			try {
+				lockChromeControl();
+				ctx.ui.notify("Chrome control authorization expired. Run /chrome authorize to allow chrome_* tools again.", "info");
+				updateChromeStatus(ctx);
+			} catch (error) {
+				console.warn(`Failed to expire pi-chrome authorization cleanly: ${(error as Error).message}`);
+			}
+		}, Math.max(0, until - Date.now()));
 	};
 
 	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
@@ -520,6 +581,7 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", () => {
+		clearAuthExpiryTimer();
 		bridge.stop();
 		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
 			delete globalState[PI_CHROME_GLOBAL_KEY];
@@ -653,8 +715,9 @@ Usage rules:
 			ctx.ui.notify("Chrome control remains locked.", "info");
 			return;
 		}
-		registerChromeTools(pi);
 		chromeAuthorizedUntil = until;
+		activateChromeTools();
+		scheduleAuthExpiry(ctx, until);
 		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
 		updateChromeStatus(ctx);
 	};
@@ -677,7 +740,7 @@ Usage rules:
 	};
 
 	const revokeHandler = (ctx: ExtensionContext) => {
-		chromeAuthorizedUntil = undefined;
+		lockChromeControl();
 		ctx.ui.notify("Chrome control locked. Run /chrome authorize to allow chrome_* tools again.", "info");
 		updateChromeStatus(ctx);
 	};
