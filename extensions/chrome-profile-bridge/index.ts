@@ -463,6 +463,7 @@ export default function (pi: ExtensionAPI): void {
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = false;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
+	let chromeToolsRegistered = false;
 
 	const authSummary = (): string => {
 		if (chromeAuthorizedUntil === "indefinite") return "authorized indefinitely";
@@ -526,6 +527,9 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		if (!chromeToolsRegistered || !chromeControlAuthorized()) {
+			return { systemPrompt: event.systemPrompt };
+		}
 		const primer = `
 <chrome-profile-bridge>
 Chrome control is available through the chrome_* tools via a companion Chrome extension installed in the user's normal Chrome profile. Tools target the existing signed-in profile: no remote-debug port, no throwaway profile.
@@ -649,6 +653,7 @@ Usage rules:
 			ctx.ui.notify("Chrome control remains locked.", "info");
 			return;
 		}
+		registerChromeTools(pi);
 		chromeAuthorizedUntil = until;
 		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
 		updateChromeStatus(ctx);
@@ -850,6 +855,10 @@ Usage rules:
 			}
 		},
 	});
+
+	function registerChromeTools(pi: ExtensionAPI): void {
+		if (chromeToolsRegistered) return;
+		chromeToolsRegistered = true;
 
 	pi.registerTool({
 		name: "chrome_launch",
@@ -1384,4 +1393,6 @@ Usage rules:
 			return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${params.uid ?? params.selector}` }], details: { result: result as Json } };
 		},
 	});
+	}
+
 }
