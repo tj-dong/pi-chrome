@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.17.2",
+	"version": "0.17.3",
 	"scripts": {
 		"version": "node scripts/sync-manifest-version.js",
 		"prepublishOnly": "node scripts/sync-manifest-version.js"

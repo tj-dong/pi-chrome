@@ -923,7 +923,17 @@ class ChromeProfileBridge {
 			const sig = this.auth.signPeerRequest("POST", "/admin", payload);
 			if (sig) headers[AUTH_HEADER] = sig;
 		}
-		const response = await fetch(`${this.url}/admin`, { method: "POST", headers, body: payload });
+		const doFetch = () => fetch(`${this.url}/admin`, { method: "POST", headers, body: payload });
+		let response: Response;
+		try { response = await doFetch(); }
+		catch (error) {
+			// Daemon isn't reachable. Self-heal by re-running the spawn path, then retry once.
+			// Covers the common case where the daemon idle-shut-down since the Pi session started
+			// (or was killed manually) but the Pi-side bridge still thinks mode === "client".
+			console.warn(`pi-chrome: /admin fetch failed (${(error as Error).message}); re-spawning daemon and retrying`);
+			await this.ensureDaemonRunning();
+			response = await doFetch();
+		}
 		const respText = await response.text();
 		// Verify owner sig when present (paired state). For pre-pair calls, no sig to verify.
 		if (this.auth.paired) {
@@ -1011,6 +1021,13 @@ class ChromeProfileBridge {
 	}
 
 	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+		// Self-heal: re-spawn the daemon if it's gone. Cheap when daemon is up (a no-op since
+		// the version probe inside ensureDaemonRunning returns compatible immediately).
+		try {
+			const probed = probeBridgeStatus(this.host, this.port);
+			if (!probed) await this.ensureDaemonRunning();
+		} catch { /* fall through to the fetch — will surface a clearer error if anything is
+			actually broken. */ }
 		if (!this.auth.paired) {
 			throw new Error("Chrome bridge not paired with this Pi config. Run /chrome pair in the Pi session that owns the bridge first.");
 		}

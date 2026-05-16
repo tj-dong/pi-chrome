@@ -2,6 +2,17 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.17.3 — 2026-05-16
+
+### Daemon self-heal
+
+0.17.x makes the Pi process a client of a separately-spawned daemon. If the daemon idle-shuts-down (after 10 min of inactivity) or is killed externally while a Pi session is running, the next chrome_* tool call or `/chrome onboard` would surface `fetch failed` instead of recovering.
+
+- **`bridge.admin()`** catches the failed fetch, re-runs `ensureDaemonRunning()` (which probes, kills incompatible, or spawns fresh), then retries the request once.
+- **`bridge.sendViaOwner()`** pre-probes `/status`; if no daemon is reachable, it spawns one before issuing the signed `/command`.
+
+Net effect: a missing daemon transparently respawns on the next Pi-side request instead of bubbling `fetch failed` up to the user.
+
 ## 0.17.2 — 2026-05-16
 
 ### Fixes for the daemon model surfaced during 0.17.0/0.17.1 testing
