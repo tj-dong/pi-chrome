@@ -2,7 +2,13 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.23 — 2026-05-16
+
+- **Attribution.** The 0.15.22 features below are pulled from Dani Bednarski's fork (`DaniBedz/pi-chrome`). Thank you, Dani.
+
 ## 0.15.22 — 2026-05-16
+
+Features in this release are pulled from Dani Bednarski's fork (`DaniBedz/pi-chrome`). Thank you, Dani.
 
 - **Earlier page-load capture.** Companion extension now injects console/network instrumentation at `document_start`, so initial React render errors and early API calls show up in `chrome_list_console_messages` / `chrome_list_network_requests`.
 - **Quieter locked state.** Startup no longer shows a persistent Chrome bridge notification/status item before authorization; status bar appears only when Chrome control is authorized.
