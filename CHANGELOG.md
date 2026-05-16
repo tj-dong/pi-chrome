@@ -2,6 +2,22 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.17.0 — 2026-05-16
+
+### Standalone daemon (no more owner-vs-client topology)
+
+The Chrome bridge is now a separate, detached daemon process at `~/.cache/pi-chrome/<version>/daemon.cjs`. Every Pi session is a uniform client; the daemon's lifecycle is decoupled from any Pi session. Killing a Pi session never breaks Chrome control for other sessions, and `pi update` followed by starting any Pi session in a working directory automatically replaces an incompatible daemon with the new-version one.
+
+- **`ChromeProfileBridge` is now a pure client.** No more `mode: "server"` branch on Pi side. `start()` ensures the daemon is running (probes `/status`, spawns from the versioned cache dir, kills+respawns an incompatible owner). `send()` always goes through signed `/command`.
+- **Versioned daemon path.** Each pi-chrome version ships its own `daemon.cjs` and copies it to `~/.cache/pi-chrome/<version>/` on first use. Old versioned dirs coexist harmlessly; deleted by the daemon on a future release.
+- **New signed `/admin` RPC.** Pi clients call `arm-pair-window`, `reset`, and `status` on the daemon over a signed peer→owner envelope (same broker-key contract as `/command`). Pre-pairing, the first `/admin` call is allowed unauthenticated; once paired, the daemon requires the broker-key envelope. `/chrome pair`, `/chrome unpair`, and `/chrome onboard` go through `/admin` instead of mutating state in-process.
+- **`/heartbeat` endpoint** lets Pi clients keep the daemon's idle-shutdown timer alive between long gaps of chrome_* tool activity.
+- **Daemon log** at `~/.cache/pi-chrome/<version>/daemon.log`. Use to debug spawn failures.
+- **Idle shutdown.** Daemon exits after 10 minutes of no activity (no extension poll, no command). Next Pi session spawns it again.
+- **Backward compatibility.** Wire protocol is byte-identical to 0.16.x; existing paired extensions don't need to re-pair. A 0.16.x bridge running at session_start is auto-replaced.
+
+See [docs/DESIGN-0.17-daemon.md](./docs/DESIGN-0.17-daemon.md) for the architecture write-up.
+
 ## 0.16.1 — 2026-05-16
 
 ### Automatic stale-owner takeover at session_start

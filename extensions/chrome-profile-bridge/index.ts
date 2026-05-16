@@ -4,7 +4,8 @@ import { existsSync, readFileSync, statSync, mkdirSync, writeFileSync, chmodSync
 import { mkdir, writeFile, readFile, chmod } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createHash, createHmac, hkdfSync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { copyFileSync, openSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -117,6 +118,72 @@ function sameMajorMinor(a: string, b: string): boolean {
 	const [aMaj, aMin] = a.split(".").map((n) => Number(n));
 	const [bMaj, bMin] = b.split(".").map((n) => Number(n));
 	return aMaj === bMaj && aMin === bMin;
+}
+
+// Ensure the bundled daemon.cjs is copied to a versioned cache dir so each pi-chrome
+// version has a stable on-disk daemon binary independent of nvm/npm install location.
+function ensureVersionedDaemon(): string {
+	const target = join(homedir(), ".cache", "pi-chrome", PI_CHROME_VERSION, "daemon.cjs");
+	const source = join(extensionRoot(), "daemon.cjs");
+	try {
+		mkdirSync(dirname(target), { recursive: true, mode: 0o755 });
+		// Copy idempotently: if shasum already matches, skip. Cheap because daemon.cjs is small.
+		let needCopy = true;
+		if (existsSync(target)) {
+			try {
+				const a = readFileSync(target);
+				const b = readFileSync(source);
+				needCopy = a.length !== b.length || createHash("sha256").update(a).digest("hex") !== createHash("sha256").update(b).digest("hex");
+			} catch { needCopy = true; }
+		}
+		if (needCopy) copyFileSync(source, target);
+	} catch (error) {
+		console.warn(`pi-chrome: failed to stage daemon at ${target} (${(error as Error).message}); falling back to in-tree source.`);
+		return source;
+	}
+	return target;
+}
+
+function daemonLogPath(): string {
+	return join(homedir(), ".cache", "pi-chrome", PI_CHROME_VERSION, "daemon.log");
+}
+
+// Spawn the daemon as a detached child so it survives the parent Pi exiting. The child is
+// unref()'d immediately; from the Pi's perspective it's fire-and-forget. Returns the child's
+// PID for diagnostic purposes only.
+function spawnDaemon(host: string, port: number): number {
+	const daemonPath = ensureVersionedDaemon();
+	const logPath = daemonLogPath();
+	try { mkdirSync(dirname(logPath), { recursive: true }); } catch {}
+	let logFd: number;
+	try { logFd = openSync(logPath, "a"); } catch { logFd = openSync("/dev/null", "a"); }
+	const child = spawn(process.execPath, [
+		daemonPath,
+		"--host", host,
+		"--port", String(port),
+		"--version", PI_CHROME_VERSION,
+		"--log", logPath,
+	], {
+		detached: true,
+		stdio: ["ignore", logFd, logFd],
+	});
+	child.unref();
+	return child.pid ?? -1;
+}
+
+// Wait up to `timeoutMs` for /status to respond with the expected version. Returns the
+// observed status (or undefined on timeout).
+function waitForDaemonReady(host: string, port: number, timeoutMs = 4_000): Record<string, unknown> | undefined {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const probed = probeBridgeStatus(host, port);
+		if (probed && typeof (probed as { bridgeVersion?: string }).bridgeVersion === "string"
+			&& sameMajorMinor((probed as { bridgeVersion: string }).bridgeVersion, PI_CHROME_VERSION)) {
+			return probed;
+		}
+		spawnSync("sleep", ["0.1"]);
+	}
+	return undefined;
 }
 
 function killProcessGracefully(pid: number): boolean {
@@ -761,44 +828,48 @@ class ChromeProfileBridge {
 		};
 	}
 
+	// 0.17+ daemon model: pi-chrome no longer hosts the HTTP server in this Pi process. The
+	// bridge runs as a detached daemon (extensions/chrome-profile-bridge/daemon.cjs, staged at
+	// ~/.cache/pi-chrome/<version>/daemon.cjs) and Pi sessions are uniform clients that POST
+	// signed /command envelopes. `start()` ensures the daemon is running and up-to-date;
+	// `send()` continues to go through the same sendViaOwner path used by previous releases'
+	// client mode.
 	async start(): Promise<void> {
-		if (this.server || this.mode === "client") return;
-		await this.tryBind();
+		if (this.mode === "client") return;
+		await this.ensureDaemonRunning();
 	}
 
-	private async tryBind(): Promise<void> {
-		this.server = createServer((request, response) => {
-			void this.handle(request, response).catch((error) => {
-				sendJson(response, 500, { error: (error as Error).message });
-			});
-		});
-		try {
-			await new Promise<void>((resolveStart, rejectStart) => {
-				this.server!.once("error", rejectStart);
-				this.server!.listen(this.port, this.host, () => {
-					this.server!.off("error", rejectStart);
-					resolveStart();
-				});
-			});
-			this.mode = "server";
-		} catch (error) {
-			this.server.close();
-			this.server = undefined;
-			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-			await this.handleEaddrinuse();
+	private async ensureDaemonRunning(): Promise<void> {
+		const probed = probeBridgeStatus(this.host, this.port);
+		const ownerVersion = typeof (probed as { bridgeVersion?: string })?.bridgeVersion === "string"
+			? (probed as { bridgeVersion: string }).bridgeVersion
+			: undefined;
+		const compatible = ownerVersion ? sameMajorMinor(ownerVersion, PI_CHROME_VERSION) : false;
+		if (probed && compatible) {
+			this.mode = "client";
+			return;
 		}
+		if (probed && !compatible) {
+			// Incompatible owner; auto-takeover (kill + replace with our-version daemon).
+			await this.handleEaddrinuse();
+			if (this.mode === "client") return;
+			// fall through to spawn
+		}
+		const pid = spawnDaemon(this.host, this.port);
+		const ready = waitForDaemonReady(this.host, this.port, 4_000);
+		if (!ready) {
+			console.warn(`pi-chrome: daemon spawn (pid ${pid}) did not become ready within 4s; check ${daemonLogPath()}`);
+		}
+		this.mode = "client";
 	}
 
 	// Auto-takeover when the existing owner is unresponsive or running an incompatible
-	// version. Without this, a stale 0.15.x Pi process holding :17318 would block every new
-	// 0.16.x session from ever reaching the extension.
+	// version. After kill, a fresh daemon is spawned by `ensureDaemonRunning`.
 	private async handleEaddrinuse(): Promise<void> {
 		const probed = probeBridgeStatus(this.host, this.port);
 		const ownerVersion = typeof probed?.bridgeVersion === "string" ? probed.bridgeVersion : undefined;
 		const compatible = ownerVersion ? sameMajorMinor(ownerVersion, PI_CHROME_VERSION) : false;
 		if (probed && compatible) {
-			// Healthy same-version owner. Share the bridge as a client; signed `/command` does
-			// the rest.
 			this.mode = "client";
 			return;
 		}
@@ -821,17 +892,32 @@ class ChromeProfileBridge {
 			this.mode = "client";
 			return;
 		}
-		// Port freed by the now-dead owner. Re-attempt the bind once. If it still fails (e.g.
-		// a third process grabbed the port between kill and listen), give up to client mode.
-		try {
-			await this.tryBind();
-			if (this.mode === "server") {
-				console.warn(`pi-chrome: took over bridge port :${this.port} from PID ${pid}.`);
-			}
-		} catch (error) {
-			console.warn(`pi-chrome: re-bind after takeover failed (${(error as Error).message}); falling back to client mode.`);
-			this.mode = "client";
+		console.warn(`pi-chrome: killed PID ${pid}; will spawn the daemon next.`);
+	}
+
+	// Signed admin RPC to the daemon. Used for state mutations the daemon owns: arm-pair-window,
+	// reset, status. Pre-pair (when the daemon has no state file), unauthenticated; once paired,
+	// the daemon requires the broker-key envelope (same signature as /command).
+	async admin(op: string, body: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+		const payload = JSON.stringify({ op, ...body });
+		const headers: Record<string, string> = { "content-type": "application/json" };
+		if (this.auth.paired) {
+			const sig = this.auth.signPeerRequest("POST", "/admin", payload);
+			if (sig) headers[AUTH_HEADER] = sig;
 		}
+		const response = await fetch(`${this.url}/admin`, { method: "POST", headers, body: payload });
+		const respText = await response.text();
+		// Verify owner sig when present (paired state). For pre-pair calls, no sig to verify.
+		if (this.auth.paired) {
+			const respAuth = response.headers.get(AUTH_HEADER) ?? undefined;
+			if (!this.auth.verifyOwnerResponse("POST", "/admin", respAuth, respText)) {
+				throw new Error("daemon /admin response signature invalid");
+			}
+		}
+		let parsed: Record<string, unknown>;
+		try { parsed = JSON.parse(respText); } catch { throw new Error(`daemon /admin returned non-JSON: ${respText.slice(0, 200)}`); }
+		if (!response.ok || parsed.ok === false) throw new Error(String(parsed.error ?? `daemon /admin HTTP ${response.status}`));
+		return parsed;
 	}
 
 	stop(): void {
@@ -854,8 +940,11 @@ class ChromeProfileBridge {
 	}
 
 	send(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
-		if (this.mode === "client") return this.sendViaOwner(action, params, timeoutMs, signal);
-		return this.sendLocal(action, params, timeoutMs, signal);
+		// 0.17+: all sends go through the daemon over signed /command (sendViaOwner). The
+		// previous in-process queue path (sendLocal) is dead code retained only to support
+		// the legacy ChromeProfileBridge.handle() HTTP server below, which is itself dead in
+		// 0.17 (the daemon owns the listener).
+		return this.sendViaOwner(action, params, timeoutMs, signal);
 	}
 
 	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
@@ -1351,8 +1440,7 @@ Usage rules:
 			ctx.ui.notify("Checking pi-chrome…", "info");
 			const lines: string[] = [`pi-chrome v${PI_CHROME_VERSION}`];
 			const status = bridge.status();
-			const roleLabel = status.mode === "client" ? "sharing another pi session's connection" : "running the Chrome connection for this machine";
-			lines.push(`• This pi session is ${roleLabel}.`);
+			lines.push(`• This pi session talks to the pi-chrome daemon (every session is a peer in 0.17+).`);
 			if (bridge.bridgeAuth.paired) {
 				lines.push(`✓ Bridge paired with extension ${bridge.bridgeAuth.pinnedExtensionId} (bridgeId ${bridge.bridgeAuth.bridgeId}).`);
 			} else {
@@ -1493,24 +1581,26 @@ Usage rules:
 
 	// `/chrome pair` is the bare-bones pairing step, useful when the extension is already
 	// installed and you just need to re-arm or re-pair. First-time setup should use
-	// /chrome onboard which wraps this with installation guidance.
+	// /chrome onboard which wraps this with installation guidance. The daemon owns the
+	// pair-window state; Pi just RPCs in.
 	const pairHandler = async (ctx: ExtensionContext) => {
-		if (bridge.status().mode === "client") {
-			ctx.ui.notify(
-				"This Pi session is sharing another session's Chrome bridge. Run /chrome pair from the Pi session that owns the bridge (the first one started in this cwd).",
-				"warning",
-			);
-			return;
-		}
+		let replace = false;
 		if (bridge.bridgeAuth.paired) {
-			const replace = await ctx.ui.confirm(
+			const ok = await ctx.ui.confirm(
 				"Re-pair Chrome bridge?",
 				"The bridge is already paired with a Chrome extension. Re-pairing will invalidate the current keys and you'll need to re-paste the new invite into the extension popup.\n\nPress Enter to continue, or Esc to cancel.",
 			);
-			if (!replace) { ctx.ui.notify("Pairing cancelled.", "info"); return; }
-			bridge.bridgeAuth.reset();
+			if (!ok) { ctx.ui.notify("Pairing cancelled.", "info"); return; }
+			replace = true;
 		}
-		const invite = bridge.bridgeAuth.startPairWindow();
+		let invite: string;
+		try {
+			const resp = await bridge.admin("arm-pair-window", { replace });
+			invite = String(resp.invite);
+		} catch (error) {
+			ctx.ui.notify(`Failed to arm pair window: ${(error as Error).message}`, "warning");
+			return;
+		}
 		await copyToClipboard(ctx, invite);
 		ctx.ui.notify(
 			[
@@ -1526,16 +1616,6 @@ Usage rules:
 	};
 
 	const unpairHandler = async (ctx: ExtensionContext) => {
-		// Mirror of /chrome pair: only the bridge owner can authoritatively unpair. A peer that
-		// rewrites the shared config file would leave the owner's in-memory keys intact, and
-		// commands would keep flowing until the owner restarts.
-		if (bridge.status().mode === "client") {
-			ctx.ui.notify(
-				"This Pi session is sharing another session's Chrome bridge. Run /chrome unpair from the owner Pi session (the first one started in this cwd).",
-				"warning",
-			);
-			return;
-		}
 		if (!bridge.bridgeAuth.paired) {
 			ctx.ui.notify("pi-chrome is not currently paired.", "info");
 			return;
@@ -1545,52 +1625,12 @@ Usage rules:
 			"This clears the stored extension ID + HMAC keys. Every Pi session will need to re-pair (and the Chrome extension popup will need to be re-armed).\n\nPress Enter to confirm, or Esc to cancel.",
 		);
 		if (!proceed) { ctx.ui.notify("Unpair cancelled.", "info"); return; }
-		bridge.bridgeAuth.reset();
-		ctx.ui.notify("pi-chrome unpaired. Run /chrome pair to start a new pairing.", "info");
-	};
-
-	// Locate the OS-level owner of the bridge listener via `lsof`. Used by /chrome onboard to
-	// detect an older pi-chrome process still holding `:17318` that won't honor the new
-	// pairing protocol. macOS + most Linux distros ship `lsof`; if it isn't available we
-	// return undefined and the caller falls back to printing instructions for the user.
-	const findBridgeOwnerPid = async (ctx: ExtensionContext): Promise<number | undefined> => {
-		if (process.platform === "win32") return undefined;
 		try {
-			const { stdout } = await pi.exec("sh", ["-lc", `lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN -t 2>/dev/null | head -1`], { cwd: workspaceCwd(ctx), timeout: 3_000 });
-			const pid = Number(String(stdout).trim());
-			return Number.isFinite(pid) && pid > 0 ? pid : undefined;
-		} catch {
-			return undefined;
+			await bridge.admin("reset");
+			ctx.ui.notify("pi-chrome unpaired. Run /chrome pair to start a new pairing.", "info");
+		} catch (error) {
+			ctx.ui.notify(`Failed to unpair: ${(error as Error).message}`, "warning");
 		}
-	};
-
-	// Kill the foreign owner (TERM then KILL), wait for the port to actually free, then
-	// take it over by stop()/start()ing the local bridge. Returns true on success.
-	const takeOverBridgePort = async (ctx: ExtensionContext, ownerPid: number): Promise<boolean> => {
-		await pi.exec("sh", ["-lc", `kill ${ownerPid} 2>/dev/null || true`], { cwd: workspaceCwd(ctx), timeout: 3_000 }).catch(() => undefined);
-		// SIGTERM first; if the process hasn't released the port within ~3s, escalate.
-		for (let i = 0; i < 12; i++) {
-			const still = await findBridgeOwnerPid(ctx);
-			if (!still || still !== ownerPid) break;
-			await new Promise((r) => setTimeout(r, 250));
-		}
-		const stillAfterTerm = await findBridgeOwnerPid(ctx);
-		if (stillAfterTerm === ownerPid) {
-			await pi.exec("sh", ["-lc", `kill -9 ${ownerPid} 2>/dev/null || true`], { cwd: workspaceCwd(ctx), timeout: 3_000 }).catch(() => undefined);
-			for (let i = 0; i < 12; i++) {
-				const still = await findBridgeOwnerPid(ctx);
-				if (!still || still !== ownerPid) break;
-				await new Promise((r) => setTimeout(r, 250));
-			}
-		}
-		const stillFinal = await findBridgeOwnerPid(ctx);
-		if (stillFinal === ownerPid) return false;
-		// Port should now be free (or a different process picked it up; either way our previous
-		// owner is gone). Drop client-mode and re-bind as server. bridge.start() handles
-		// EADDRINUSE again if some unrelated process grabbed the port between kill and listen.
-		bridge.stop();
-		await bridge.start();
-		return bridge.status().mode === "server";
 	};
 
 	const copyToClipboard = async (ctx: ExtensionContext, text: string): Promise<void> => {
@@ -1644,65 +1684,19 @@ Usage rules:
 			return;
 		}
 
-		// --- Step 0: deal with a foreign bridge owner. -----------------------------------
-		// If another Pi process owns :17318, our local bridge is in client mode and forwards
-		// every command through that owner. If the owner is on an older pi-chrome (no /pair,
-		// no signed envelopes), the whole flow fails silently. Detect it and offer to kill
-		// the foreign owner so this session can take over.
-		const ownerPid = await findBridgeOwnerPid(ctx);
-		if (bridge.status().mode === "client" && (!ownerPid || ownerPid === process.pid)) {
-			// Fallback when `lsof` isn't available (e.g. minimal Linux container): we know we're
-			// a client but can't locate the owner to kill it. Surface a clear instruction.
-			ctx.ui.notify(
-				[
-					`This Pi session is in client mode (another Pi process owns :${DEFAULT_PORT}), but pi-chrome can't locate the owner via lsof on this platform.`,
-					`Manually identify and kill it, then re-run /chrome onboard:`,
-					`  lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN`,
-					`  kill <pid>`,
-				].join("\n"),
-				"warning",
-			);
+		// --- Step 1: reset daemon-side pairing state. ------------------------------------
+		// In 0.17 the daemon is automatically spawned/upgraded at session_start (see
+		// ChromeProfileBridge.ensureDaemonRunning), so /chrome onboard no longer needs to
+		// detect-and-kill stale owners. We just admin-reset the pairing record and proceed.
+		// Daemon clears `~/.config/pi/chrome-bridge.json` on its side. Any cached extension keys
+		// in chrome.storage.local will become invalid, but that's fine because we're about to
+		// mint a fresh invite and re-pair. fs.watch + refreshIfStale on the daemon's BridgeAuth
+		// also propagates the reset to in-memory state immediately.
+		const hadPriorPairing = bridge.bridgeAuth.paired;
+		try { await bridge.admin("reset"); } catch (error) {
+			ctx.ui.notify(`Failed to reset prior pairing: ${(error as Error).message}`, "warning");
 			return;
 		}
-		if (ownerPid && ownerPid !== process.pid) {
-			const kill = await ctx.ui.confirm(
-				`Another Pi process owns the Chrome bridge (PID ${ownerPid})`,
-				[
-					`A different Pi process is currently listening on :${DEFAULT_PORT}. If it's running an older pi-chrome it doesn't know about pairing, and onboarding from this session won't reach the extension.`,
-					``,
-					`pi-chrome will kill PID ${ownerPid} and have this Pi session take over the bridge.`,
-					``,
-					`Press Enter to kill it, or Esc to abort.`,
-				].join("\n"),
-			);
-			if (!kill) {
-				ctx.ui.notify("Cancelled. Re-run /chrome onboard when ready, or manually `kill` the older Pi process holding the port.", "info");
-				return;
-			}
-			ctx.ui.notify(`Killing PID ${ownerPid} and taking over :${DEFAULT_PORT}…`, "info");
-			const took = await takeOverBridgePort(ctx, ownerPid);
-			if (!took) {
-				ctx.ui.notify(
-					[
-						`✗ Could not take over the bridge from PID ${ownerPid}.`,
-						`  Either the process didn't release the port, or another process grabbed it immediately.`,
-						`  Inspect with: lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN`,
-						`  Then re-run /chrome onboard.`,
-					].join("\n"),
-					"warning",
-				);
-				return;
-			}
-			ctx.ui.notify(`✓ This Pi session now owns the Chrome bridge on :${DEFAULT_PORT}.`, "info");
-		}
-
-		// --- Step 1: reset Pi-side state. ------------------------------------------------
-		// Always clears `~/.config/pi/chrome-bridge.json`. Any cached extension keys in
-		// chrome.storage.local will become invalid, but that's fine because we're about to
-		// mint a fresh invite and re-pair. The popup's auto-poll will surface 'unpaired'
-		// immediately because of the fs.watch + refreshIfStale plumbing on the bridge.
-		const hadPriorPairing = bridge.bridgeAuth.paired;
-		bridge.bridgeAuth.reset();
 		if (hadPriorPairing) {
 			ctx.ui.notify(
 				"Cleared the previous pairing record. The extension popup may still show 'Paired' until it polls again; that's fine — we'll re-pair below.",
@@ -1772,7 +1766,14 @@ Usage rules:
 		ctx.ui.notify("✓ Extension is polling.", "info");
 
 		// --- Step 3: mint invite, wait for the popup to complete the /pair handshake. ----
-		const invite = bridge.bridgeAuth.startPairWindow();
+		let invite: string;
+		try {
+			const resp = await bridge.admin("arm-pair-window", { replace: true });
+			invite = String(resp.invite);
+		} catch (error) {
+			ctx.ui.notify(`Failed to arm pair window: ${(error as Error).message}`, "warning");
+			return;
+		}
 		await copyToClipboard(ctx, invite);
 		ctx.ui.notify(
 			[
