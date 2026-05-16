@@ -21,27 +21,55 @@ You:    [keeps coding — agent never asked you to log in]
 pi install npm:pi-chrome
 ```
 
-Then in Pi:
+Then in Pi (do this **once per machine**):
 
 ```text
 /chrome onboard
 ```
 
-On macOS this opens `chrome://extensions`, reveals the bundled `browser-extension/` folder in Finder, and copies its path to your clipboard. In Chrome: **Developer mode** → **Load unpacked** → paste the path. Done.
+Walks you through a two-step interactive flow:
 
-Verify, then authorize current Pi session from the terminal:
+1. **Install the Chrome extension.** On macOS, pi-chrome opens `chrome://extensions`, reveals the bundled `browser-extension/` folder in Finder, and copies its path to your clipboard. In Chrome: **Developer mode** → **Load unpacked** → paste the path. Press Enter in Pi when the extension shows up.
+2. **Pair the extension with this Pi bridge.** Pi mints a one-time `pcp_…` invite (also copied to clipboard). Click the **Pi Chrome Connector** toolbar icon in Chrome, paste the invite into the popup, and click *Pair*. Press Enter in Pi to confirm.
+
+Pairing binds your specific Chrome extension instance to this Pi config via an HMAC handshake. Without it the bridge cannot tell your extension apart from any other Chrome extension on the same browser, so it refuses to deliver any commands at all. See [Why pairing?](#why-pairing) below.
+
+Then, in any Pi session where you want to use chrome_* tools:
+
+```text
+/chrome authorize 15m       # or 30m, or indefinite
+```
+
+Verify anytime:
 
 ```text
 /chrome doctor
-/chrome authorize
 ```
 
 ```text
-Performing Chrome bridge health check
 pi-chrome v<version>
-• Local bridge: mode=server, url=http://127.0.0.1:17318
-✓ Companion Chrome extension responding (ID: <chrome-extension-id>, ext v<version>)
+• This pi session is running the Chrome connection for this machine.
+✓ Bridge paired with extension <chrome-extension-id> (bridgeId <id>).
+✓ Chrome is connected (companion extension v<version>, responded in <ms>ms).
+✓ pi-chrome can run code in the active Chrome tab.
 ```
+
+### Why pairing?
+
+The bridge listens on `127.0.0.1:17318`. Any Chrome extension with localhost host permissions — not just pi-chrome — can `fetch()` that port; Chrome's origin model blocks ordinary web pages but not extension code. Without an explicit pairing step, an unrelated extension could poll for queued commands (which include selectors, typed text, eval source, file-upload paths) or post forged results. `/chrome onboard` fixes that by deriving a shared HMAC key during the popup paste step and pinning the exact extension ID. After that, every `/next` / `/result` / `/command` request must be signed; replays and mismatched origins are rejected. Same-user malware that can read `~/.config/pi/chrome-bridge.json` is explicitly out of scope; see [SECURITY.md](./SECURITY.md).
+
+### Day-to-day commands
+
+| Command | When to use |
+|---|---|
+| `/chrome authorize [15m\|30m\|<min>\|indefinite]` | Per Pi session, unlock chrome_* tools. |
+| `/chrome revoke` | Lock chrome_* tools again. |
+| `/chrome status` | One-line summary: connection / auth / background mode. |
+| `/chrome doctor` | Full health check; tells you exactly what's missing. |
+| `/chrome onboard` | First-time setup, or re-install + re-pair after a Chrome profile move. |
+| `/chrome pair` | Re-pair an already-installed extension (subset of `onboard`). |
+| `/chrome unpair` | Clear pairing keys; every Pi session will need to re-pair. |
+| `/chrome background [on\|off\|status\|toggle]` | Run without focusing Chrome. |
 
 ---
 

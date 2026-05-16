@@ -1,8 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, statSync, mkdirSync, writeFileSync, chmodSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { mkdir, writeFile, readFile, chmod } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createHash, createHmac, hkdfSync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 /**
@@ -54,9 +56,463 @@ function readPiChromeVersion(): string {
 }
 const PI_CHROME_VERSION = readPiChromeVersion();
 const PI_CHROME_GLOBAL_KEY = "__piChromeProfileBridgeLoaded__";
-const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
+const DANGEROUS_REMOTE_ENV = "PI_CHROME_BRIDGE_DANGEROUS_REMOTE";
+const RAW_HOST_ENV = process.env.PI_CHROME_BRIDGE_HOST;
+const DANGEROUS_REMOTE_ENABLED = process.env[DANGEROUS_REMOTE_ENV] === "1";
+function resolveDefaultHost(): string {
+	if (!RAW_HOST_ENV) return "127.0.0.1";
+	const hostIsLoopback = RAW_HOST_ENV === "127.0.0.1" || RAW_HOST_ENV === "::1" || RAW_HOST_ENV === "localhost";
+	if (hostIsLoopback) return RAW_HOST_ENV;
+	if (!DANGEROUS_REMOTE_ENABLED) {
+		console.warn(
+			`pi-chrome: ignoring PI_CHROME_BRIDGE_HOST=${RAW_HOST_ENV} (non-loopback). Set ${DANGEROUS_REMOTE_ENV}=1 to opt in explicitly.`,
+		);
+		return "127.0.0.1";
+	}
+	console.warn(`pi-chrome: ${DANGEROUS_REMOTE_ENV}=1 — binding bridge to ${RAW_HOST_ENV}. Bridge endpoints still require loopback or paired auth.`);
+	return RAW_HOST_ENV;
+}
+const DEFAULT_HOST = resolveDefaultHost();
 const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024; // 1 MiB hard cap on inbound HTTP bodies
+const MAX_QUEUE = 256;
+const MAX_PENDING = 256;
+const MAX_WAITERS = 4;
+
+function isLoopbackAddress(address: string | undefined): boolean {
+	if (!address) return false;
+	return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+// =========================================================================================
+// Pairing + signed-envelope auth.
+//
+// Protocol v1.
+//
+// Threat model: protect against (a) ordinary web pages, (b) drive-by local processes / curl
+// without the pairing secret, (c) malicious Chrome extensions stealing the command channel.
+// Out of scope: same-user malware that can read $XDG_CONFIG_HOME, replace native messaging
+// hosts, or attach a debugger to Pi/Chrome.
+//
+// Pairing flow:
+//   1. User runs `/chrome pair` in Pi. Pi generates a 32-byte invite secret, presents it as
+//      `pcp_<base64url>`, copies to clipboard, and arms `/pair` for `PAIR_WINDOW_MS`.
+//   2. User pastes the invite into the Chrome extension popup. Extension POSTs `/pair` with
+//      {extensionId, extensionNonce, mac(=HMAC(invite, "pair-v1|" + extensionId + "|" + extensionNonce))}.
+//   3. Bridge verifies MAC, mints a `bridgeId` + derives two 32-byte HKDF keys:
+//        - extensionPairKey: signs/verifies /next and /result envelopes.
+//        - brokerKey: signs/verifies /command envelopes between peer Pi processes.
+//      Bridge replies signed with the invite secret so the extension knows it's talking to
+//      the same Pi process that issued the invite. Invite is destroyed.
+//   4. Both sides persist their copies. Pi keeps the master record at
+//      ~/.config/pi/chrome-bridge.json mode 0600; extension keeps mirror in
+//      chrome.storage.local.
+//
+// Wire format on signed requests/responses:
+//   x-pi-chrome-auth: v1 ts=<ms> nonce=<base64url-16B> sig=<base64url-32B>
+// where sig = HMAC-SHA256(key, canonicalSigningString).
+//
+// Canonical signing string (newline-separated):
+//   v1\n<direction>\n<method>\n<path>\n<extensionId>\n<bridgeId>\n<ts>\n<nonce>\n<sha256-hex(body)>
+//
+// direction ∈ { "ext->bridge", "bridge->ext", "peer->owner", "owner->peer" }.
+// For empty bodies (GET /next), body = "".
+//
+// Replay defense: receiver requires |now - ts| <= MAX_CLOCK_SKEW_MS and rejects re-used
+// nonces via a per-direction LRU.
+
+const AUTH_PROTOCOL = "v1";
+const AUTH_HEADER = "x-pi-chrome-auth";
+const PAIR_WINDOW_MS = 10 * 60_000;
+const MAX_CLOCK_SKEW_MS = 30_000;
+const NONCE_TTL_MS = 5 * 60_000;
+const NONCE_CACHE_MAX = 4096;
+
+function configPath(): string {
+	const base = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+	return join(base, "pi", "chrome-bridge.json");
+}
+function b64url(buf: Buffer): string {
+	return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(text: string): Buffer {
+	const padded = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (text.length % 4)) % 4);
+	return Buffer.from(padded, "base64");
+}
+function sha256Hex(input: string | Buffer): string {
+	return createHash("sha256").update(input).digest("hex");
+}
+function hmacSign(key: Buffer, message: string): Buffer {
+	return createHmac("sha256", key).update(message).digest();
+}
+function safeStringEqual(a: string, b: string): boolean {
+	const aBuf = Buffer.from(a, "utf8");
+	const bBuf = Buffer.from(b, "utf8");
+	if (aBuf.length !== bBuf.length) return false;
+	try { return timingSafeEqual(aBuf, bBuf); } catch { return false; }
+}
+function safeBufferEqual(a: Buffer, b: Buffer): boolean {
+	if (a.length !== b.length) return false;
+	try { return timingSafeEqual(a, b); } catch { return false; }
+}
+
+type PairDirection = "ext->bridge" | "bridge->ext" | "peer->owner" | "owner->peer";
+
+function canonicalString(
+	direction: PairDirection,
+	method: string,
+	path: string,
+	extensionId: string,
+	bridgeId: string,
+	ts: number,
+	nonce: string,
+	body: string,
+): string {
+	return [AUTH_PROTOCOL, direction, method.toUpperCase(), path, extensionId, bridgeId, String(ts), nonce, sha256Hex(body)].join("\n");
+}
+
+function buildAuthHeader(key: Buffer, direction: PairDirection, method: string, path: string, extensionId: string, bridgeId: string, body: string): { header: string; ts: number; nonce: string } {
+	const ts = Date.now();
+	const nonce = b64url(randomBytes(16));
+	const sig = b64url(hmacSign(key, canonicalString(direction, method, path, extensionId, bridgeId, ts, nonce, body)));
+	return { header: `${AUTH_PROTOCOL} ts=${ts} nonce=${nonce} sig=${sig}`, ts, nonce };
+}
+
+function parseAuthHeader(raw: string | string[] | undefined): { ts: number; nonce: string; sig: string } | undefined {
+	const value = Array.isArray(raw) ? raw[0] : raw;
+	if (!value || typeof value !== "string") return undefined;
+	const parts = value.trim().split(/\s+/);
+	if (parts.length !== 4 || parts[0] !== AUTH_PROTOCOL) return undefined;
+	const kv: Record<string, string> = {};
+	for (const p of parts.slice(1)) {
+		const eq = p.indexOf("=");
+		if (eq <= 0) return undefined;
+		kv[p.slice(0, eq)] = p.slice(eq + 1);
+	}
+	const ts = Number(kv.ts);
+	if (!Number.isFinite(ts) || !kv.nonce || !kv.sig) return undefined;
+	return { ts, nonce: kv.nonce, sig: kv.sig };
+}
+
+// Bounded LRU of (nonce -> ts) per direction for replay defense. Map iteration order is
+// insertion order, so evicting `keys().next()` removes the oldest entry. Two callers:
+//
+//  - `has(nonce)` checks duplicates *before* MAC verification (cheap; lets us reject obvious
+//    replays without wasting an HMAC compute).
+//  - `store(nonce, ts)` records the nonce *after* MAC verification succeeds, so an attacker
+//    sending fresh-nonce bogus signatures cannot pin memory or pollute the cache.
+class NonceCache {
+	private readonly entries = new Map<string, number>();
+	has(nonce: string): boolean { return this.entries.has(nonce); }
+	store(nonce: string, ts: number): void {
+		const now = Date.now();
+		// Drop stale entries opportunistically.
+		for (const [k, t] of this.entries) {
+			if (now - t > NONCE_TTL_MS) this.entries.delete(k); else break;
+		}
+		// Hard cap: evict oldest insertions until we're under the limit, even if not stale.
+		while (this.entries.size >= NONCE_CACHE_MAX) {
+			const oldest = this.entries.keys().next().value;
+			if (oldest === undefined) break;
+			this.entries.delete(oldest);
+		}
+		this.entries.set(nonce, ts);
+	}
+}
+
+type PersistedAuthState = {
+	protocol: "v1";
+	bridgeId: string;
+	extensionId: string;
+	extensionPairKey: string; // base64url, shared with the Chrome extension
+	brokerKey: string; // base64url, Pi-side only — never sent to the extension
+};
+
+class BridgeAuth {
+	private state: PersistedAuthState | undefined;
+	private pendingInvite: { secret: Buffer; expiresAt: number } | undefined;
+	private extNonces = new NonceCache(); // request: ext->bridge
+	private peerNonces = new NonceCache(); // request: peer->owner
+	private ownerRespNonces = new NonceCache(); // response: owner->peer (verified peer-side)
+	private lastStateMtimeMs: number = 0;
+	private watcher: FSWatcher | undefined;
+
+	constructor() {
+		this.load();
+		this.startWatching();
+	}
+
+	private startWatching(): void {
+		// fs.watch the config file so cross-process changes (e.g. another Pi running `/chrome
+		// unpair`, or an external `rm` of the file) immediately propagate to this owner's
+		// in-memory state. Without this, an owner that already cached `state` keeps verifying
+		// signatures with stale keys long after the file is gone. fs.watch is best-effort
+		// across platforms; we also re-check mtime synchronously on every privileged request
+		// (see refreshIfStale) so a missed watch event can never silently desync.
+		const path = configPath();
+		const dir = dirname(path);
+		try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch {}
+		try {
+			this.watcher = fsWatch(dir, { persistent: false }, (_event, filename) => {
+				if (!filename || filename.toString() !== "chrome-bridge.json") return;
+				this.refreshIfStale();
+			});
+		} catch (error) {
+			console.warn(`pi-chrome: fs.watch on ${dir} failed (${(error as Error).message}); falling back to per-request mtime checks.`);
+		}
+	}
+
+	stop(): void {
+		try { this.watcher?.close(); } catch {}
+		this.watcher = undefined;
+	}
+
+	// Synchronously re-stat the config file and reload if anything changed on disk. Called
+	// before every privileged verification so that cross-process mutations (peer unpair,
+	// external file edits) can never let stale in-memory keys validate a request.
+	refreshIfStale(): void {
+		const path = configPath();
+		let mtimeMs = 0;
+		try { mtimeMs = statSync(path).mtimeMs; } catch { mtimeMs = -1; }
+		if (mtimeMs === this.lastStateMtimeMs) return;
+		this.lastStateMtimeMs = mtimeMs;
+		const prevExtId = this.state?.extensionId;
+		const prevBridgeId = this.state?.bridgeId;
+		this.load();
+		const rotated = (this.state?.extensionId !== prevExtId) || (this.state?.bridgeId !== prevBridgeId);
+		if (rotated) {
+			// Keys rotated (or pairing cleared). Drop replay caches; old nonces signed under the
+			// previous keys are meaningless under the new ones and would otherwise needlessly
+			// occupy cache slots.
+			this.extNonces = new NonceCache();
+			this.peerNonces = new NonceCache();
+			this.ownerRespNonces = new NonceCache();
+		}
+	}
+
+	get paired(): boolean { this.refreshIfStale(); return Boolean(this.state); }
+	get bridgeId(): string { this.refreshIfStale(); return this.state?.bridgeId ?? ""; }
+	get pinnedExtensionId(): string { this.refreshIfStale(); return this.state?.extensionId ?? ""; }
+
+	private load(): void {
+		try {
+			const raw = readFileSync(configPath(), "utf8");
+			const parsed = JSON.parse(raw);
+			if (parsed?.protocol === "v1" && parsed.bridgeId && parsed.extensionId && parsed.extensionPairKey && parsed.brokerKey) {
+				this.state = parsed as PersistedAuthState;
+			} else {
+				// File exists but doesn't carry a valid v1 record (e.g. peer reset wrote `{}`).
+				// Drop in-memory state so this owner stops accepting signatures keyed by the
+				// now-deleted record.
+				this.state = undefined;
+			}
+		} catch {
+			// File missing or unreadable: treat as unpaired.
+			this.state = undefined;
+		}
+	}
+
+	private persist(): void {
+		if (!this.state) return;
+		const path = configPath();
+		try {
+			const dir = dirname(path);
+			mkdirSync(dir, { recursive: true, mode: 0o700 });
+			writeFileSync(path, JSON.stringify(this.state), { mode: 0o600 });
+			try { chmodSync(path, 0o600); } catch {}
+			try { chmodSync(dir, 0o700); } catch {}
+			try { this.lastStateMtimeMs = statSync(path).mtimeMs; } catch {}
+		} catch (error) {
+			console.warn(`pi-chrome: failed to persist auth state at ${path}: ${(error as Error).message}`);
+		}
+	}
+
+	// `/chrome pair` calls this; returns the invite to display to the user.
+	startPairWindow(): string {
+		const secret = randomBytes(32);
+		this.pendingInvite = { secret, expiresAt: Date.now() + PAIR_WINDOW_MS };
+		return `pcp_${b64url(secret)}`;
+	}
+
+	cancelPairWindow(): void { this.pendingInvite = undefined; }
+
+	pairWindowActive(): boolean {
+		if (!this.pendingInvite) return false;
+		if (this.pendingInvite.expiresAt < Date.now()) { this.pendingInvite = undefined; return false; }
+		return true;
+	}
+
+	reset(): void {
+		this.state = undefined;
+		this.pendingInvite = undefined;
+		const path = configPath();
+		try { writeFileSync(path, JSON.stringify({}), { mode: 0o600 }); } catch {}
+		try { chmodSync(path, 0o600); } catch {}
+		try { chmodSync(dirname(path), 0o700); } catch {}
+	}
+
+	// Verify extension's /pair POST. Returns the response payload + signed header on success.
+	completePairing(body: { extensionId?: string; extensionNonce?: string; mac?: string }): { response: Record<string, unknown>; signedHeader: string } {
+		if (!this.pairWindowActive()) throw new Error("no active pairing window; run /chrome pair first");
+		if (!body.extensionId || !body.extensionNonce || !body.mac) throw new Error("pair: missing fields");
+		// Chrome extension IDs are 32 lowercase a-p characters. Reject uppercase or mixed case
+		// so a malicious caller can't smuggle a value that looks like one ID and matches another
+		// after case folding.
+		if (!/^[a-p]{32}$/.test(body.extensionId)) throw new Error("pair: invalid extensionId");
+		const invite = this.pendingInvite!.secret;
+		const expected = hmacSign(invite, `pair-v1|${body.extensionId}|${body.extensionNonce}`);
+		const supplied = b64urlDecode(body.mac);
+		if (!safeBufferEqual(expected, supplied)) throw new Error("pair: bad mac");
+		const bridgeId = b64url(randomBytes(16));
+		const extensionPairKey = Buffer.from(hkdfSync("sha256", invite, Buffer.from("pi-chrome-pair-salt"), Buffer.from("ext-pair-key:" + bridgeId), 32));
+		const brokerKey = Buffer.from(hkdfSync("sha256", invite, Buffer.from("pi-chrome-pair-salt"), Buffer.from("broker-key:" + bridgeId), 32));
+		this.state = {
+			protocol: "v1",
+			bridgeId,
+			extensionId: body.extensionId,
+			extensionPairKey: b64url(extensionPairKey),
+			brokerKey: b64url(brokerKey),
+		};
+		this.persist();
+		this.pendingInvite = undefined;
+		// Sign response with the invite (extension still has it) so it can verify before storing
+		// the long-lived keys returned in the body.
+		//
+		// IMPORTANT: do NOT include brokerKey in the response. The extension never uses it;
+		// it is exclusively for peer Pi sessions reading `~/.config/pi/chrome-bridge.json`.
+		// Leaking it into the browser would broaden blast radius if the extension is later
+		// compromised.
+		const response: Record<string, unknown> = {
+			ok: true,
+			bridgeId,
+			extensionId: body.extensionId,
+			extensionPairKey: this.state.extensionPairKey,
+			protocol: AUTH_PROTOCOL,
+		};
+		const bodyText = JSON.stringify(response);
+		const { header } = buildAuthHeader(invite, "bridge->ext", "POST", "/pair", body.extensionId, bridgeId, bodyText);
+		return { response, signedHeader: header };
+	}
+
+	private verifyEnvelope(
+		key: Buffer,
+		cache: NonceCache,
+		direction: PairDirection,
+		method: string,
+		path: string,
+		extensionId: string,
+		bridgeId: string,
+		header: string | string[] | undefined,
+		body: string,
+	): boolean {
+		const parsed = parseAuthHeader(header);
+		if (!parsed) return false;
+		if (Math.abs(Date.now() - parsed.ts) > MAX_CLOCK_SKEW_MS) return false;
+		// Cheap replay check BEFORE the HMAC compute: reject duplicates immediately.
+		if (cache.has(parsed.nonce)) return false;
+		const expected = hmacSign(key, canonicalString(direction, method, path, extensionId, bridgeId, parsed.ts, parsed.nonce, body));
+		let supplied: Buffer;
+		try { supplied = b64urlDecode(parsed.sig); } catch { return false; }
+		if (!safeBufferEqual(expected, supplied)) return false;
+		// Only record AFTER MAC verifies so bogus-signature spam cannot bloat the cache.
+		cache.store(parsed.nonce, parsed.ts);
+		return true;
+	}
+
+	verifyExtensionRequest(method: string, path: string, header: string | string[] | undefined, originExtensionId: string, body: string): boolean {
+		this.refreshIfStale();
+		if (!this.state) return false;
+		if (!safeStringEqual(originExtensionId, this.state.extensionId)) return false;
+		return this.verifyEnvelope(
+			b64urlDecode(this.state.extensionPairKey),
+			this.extNonces,
+			"ext->bridge",
+			method,
+			path,
+			this.state.extensionId,
+			this.state.bridgeId,
+			header,
+			body,
+		);
+	}
+
+	signBridgeResponse(method: string, path: string, body: string): string | undefined {
+		if (!this.state) return undefined;
+		const { header } = buildAuthHeader(
+			b64urlDecode(this.state.extensionPairKey),
+			"bridge->ext",
+			method,
+			path,
+			this.state.extensionId,
+			this.state.bridgeId,
+			body,
+		);
+		return header;
+	}
+
+	verifyPeerRequest(method: string, path: string, header: string | string[] | undefined, body: string): boolean {
+		this.refreshIfStale();
+		if (!this.state) return false;
+		return this.verifyEnvelope(
+			b64urlDecode(this.state.brokerKey),
+			this.peerNonces,
+			"peer->owner",
+			method,
+			path,
+			this.state.extensionId,
+			this.state.bridgeId,
+			header,
+			body,
+		);
+	}
+
+	signPeerRequest(method: string, path: string, body: string): string | undefined {
+		if (!this.state) return undefined;
+		const { header } = buildAuthHeader(
+			b64urlDecode(this.state.brokerKey),
+			"peer->owner",
+			method,
+			path,
+			this.state.extensionId,
+			this.state.bridgeId,
+			body,
+		);
+		return header;
+	}
+
+	signOwnerResponse(method: string, path: string, body: string): string | undefined {
+		if (!this.state) return undefined;
+		const { header } = buildAuthHeader(
+			b64urlDecode(this.state.brokerKey),
+			"owner->peer",
+			method,
+			path,
+			this.state.extensionId,
+			this.state.bridgeId,
+			body,
+		);
+		return header;
+	}
+
+	verifyOwnerResponse(method: string, path: string, header: string | string[] | undefined, body: string): boolean {
+		this.refreshIfStale();
+		if (!this.state) return false;
+		const parsed = parseAuthHeader(header);
+		if (!parsed) return false;
+		if (Math.abs(Date.now() - parsed.ts) > MAX_CLOCK_SKEW_MS) return false;
+		if (this.ownerRespNonces.has(parsed.nonce)) return false;
+		const expected = hmacSign(
+			b64urlDecode(this.state.brokerKey),
+			canonicalString("owner->peer", method, path, this.state.extensionId, this.state.bridgeId, parsed.ts, parsed.nonce, body),
+		);
+		let supplied: Buffer;
+		try { supplied = b64urlDecode(parsed.sig); } catch { return false; }
+		if (!safeBufferEqual(expected, supplied)) return false;
+		this.ownerRespNonces.store(parsed.nonce, parsed.ts);
+		return true;
+	}
+}
 const MAX_TEXT_CHARS = 30_000;
 const MAX_ELEMENTS = 80;
 
@@ -115,13 +571,58 @@ function summarizeActionResult(result: unknown): string | undefined {
 	return parts.length ? parts.join("; ") : undefined;
 }
 
-function readRequestBody(request: IncomingMessage): Promise<string> {
+class RequestBodyTooLargeError extends Error {
+	constructor() { super("request body too large"); this.name = "RequestBodyTooLargeError"; }
+}
+function readRequestBody(request: IncomingMessage, maxBytes = MAX_REQUEST_BODY_BYTES): Promise<string> {
 	return new Promise((resolveBody, rejectBody) => {
+		// Reject too-large bodies up front when Content-Length advertises it.
+		const declared = Number(request.headers["content-length"]);
+		if (Number.isFinite(declared) && declared > maxBytes) {
+			rejectBody(new RequestBodyTooLargeError());
+			request.resume();
+			return;
+		}
 		const chunks: Buffer[] = [];
-		request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+		let size = 0;
+		request.on("data", (chunk) => {
+			const buf = Buffer.from(chunk);
+			size += buf.length;
+			if (size > maxBytes) {
+				rejectBody(new RequestBodyTooLargeError());
+				request.destroy();
+				return;
+			}
+			chunks.push(buf);
+		});
 		request.on("end", () => resolveBody(Buffer.concat(chunks).toString("utf8")));
 		request.on("error", rejectBody);
 	});
+}
+async function readJsonBody<T = unknown>(request: IncomingMessage, response: ServerResponse, extraHeaders?: Record<string, string>): Promise<T | undefined> {
+	let raw: string;
+	try {
+		raw = await readRequestBody(request);
+	} catch (error) {
+		if (error instanceof RequestBodyTooLargeError) {
+			sendJson(response, 413, { ok: false, error: "request body too large" }, extraHeaders);
+		} else {
+			sendJson(response, 400, { ok: false, error: `failed to read request body: ${(error as Error).message}` }, extraHeaders);
+		}
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw || "{}");
+	} catch (error) {
+		sendJson(response, 400, { ok: false, error: `invalid JSON body: ${(error as Error).message}` }, extraHeaders);
+		return undefined;
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		sendJson(response, 400, { ok: false, error: "expected JSON object" }, extraHeaders);
+		return undefined;
+	}
+	return parsed as T;
 }
 
 function corsHeadersFor(request: IncomingMessage): Record<string, string> {
@@ -130,8 +631,8 @@ function corsHeadersFor(request: IncomingMessage): Record<string, string> {
 	return {
 		"access-control-allow-origin": origin,
 		"access-control-allow-methods": "GET,POST,OPTIONS",
-		"access-control-allow-headers": "content-type",
-		"access-control-expose-headers": "x-pi-chrome-version",
+		"access-control-allow-headers": `content-type, ${AUTH_HEADER}`,
+		"access-control-expose-headers": `x-pi-chrome-version, ${AUTH_HEADER}`,
 		"vary": "origin",
 	};
 }
@@ -164,11 +665,23 @@ class ChromeProfileBridge {
 	private lastSeenAt: number | undefined;
 	private clientName: string | undefined;
 	private mode: "server" | "client" | undefined;
+	private readonly auth: BridgeAuth;
 
 	constructor(
 		private readonly host: string,
 		private readonly port: number,
-	) {}
+	) {
+		this.auth = new BridgeAuth();
+	}
+
+	get bridgeAuth(): BridgeAuth { return this.auth; }
+
+	private extensionIdFromOrigin(request: IncomingMessage): string | undefined {
+		const origin = String(request.headers.origin ?? "");
+		// Match Chrome's own format strictly: exact lowercase a-p, no trailing slash or path.
+		const match = origin.match(/^chrome-extension:\/\/([a-p]{32})$/);
+		return match ? match[1] : undefined;
+	}
 
 	get url(): string {
 		return `http://${this.host}:${this.port}`;
@@ -224,6 +737,7 @@ class ChromeProfileBridge {
 			this.mode = undefined;
 			return;
 		}
+		this.auth.stop();
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(new Error("Chrome profile bridge stopped"));
@@ -243,7 +757,7 @@ class ChromeProfileBridge {
 	}
 
 	private sendLocal(action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> {
-		const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+		const id = randomUUID();
 		const command = { id, action, params };
 		return new Promise((resolveCommand, rejectCommand) => {
 			if (signal?.aborted) {
@@ -270,6 +784,12 @@ class ChromeProfileBridge {
 					),
 				);
 			}, timeoutMs);
+			if (this.pending.size >= MAX_PENDING) {
+				clearTimeout(timer);
+				cleanupAbort();
+				rejectCommand(new Error("Chrome bridge has too many in-flight commands; retry shortly"));
+				return;
+			}
 			this.pending.set(id, {
 				command,
 				resolve: (value) => { cleanupAbort(); resolveCommand(value); },
@@ -282,6 +802,9 @@ class ChromeProfileBridge {
 	}
 
 	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+		if (!this.auth.paired) {
+			throw new Error("Chrome bridge not paired with this Pi config. Run /chrome pair in the Pi session that owns the bridge first.");
+		}
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeoutMs + 2_000);
 		const forwardAbort = () => controller.abort();
@@ -290,18 +813,33 @@ class ChromeProfileBridge {
 			else signal.addEventListener("abort", forwardAbort, { once: true });
 		}
 		try {
+			// Per-request signed envelope, keyed by brokerKey. No bearer token transmitted.
+			const body = JSON.stringify({ action, params, timeoutMs });
+			const sigHeader = this.auth.signPeerRequest("POST", "/command", body);
+			if (!sigHeader) throw new Error("Chrome bridge auth not available");
 			const response = await fetch(`${this.url}/command`, {
 				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ action, params, timeoutMs }),
+				headers: { "content-type": "application/json", [AUTH_HEADER]: sigHeader },
+				body,
 				signal: controller.signal,
 			});
-			const payload = (await response.json().catch(() => ({}))) as { ok?: boolean; result?: unknown; error?: string };
+			const respText = await response.text();
+			// Legacy detection: an older pi-chrome bridge owner returns 404 for /command before
+			// signed envelopes existed. Match that BEFORE signature verification (the legacy
+			// owner has no key to sign with), since this is an upgrade hint, not a data path.
 			if (response.status === 404) {
 				throw new Error(
 					"A running Pi session owns the Chrome bridge but is using an older pi-chrome without multi-session support. Restart that Pi session after `pi update`, then retry.",
 				);
 			}
+			// Verify the owner's signed response BEFORE trusting any field in the body, including
+			// error strings. A pre-bind impostor without the broker key cannot produce a valid
+			// signature, so we refuse to surface its arbitrary error text.
+			const respAuth = response.headers.get(AUTH_HEADER) ?? undefined;
+			if (!this.auth.verifyOwnerResponse("POST", "/command", respAuth, respText)) {
+				throw new Error("Chrome bridge owner response signature invalid; refusing result");
+			}
+			const payload = (() => { try { return JSON.parse(respText); } catch { return {}; } })() as { ok?: boolean; result?: unknown; error?: string };
 			if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Chrome bridge owner HTTP ${response.status}`);
 			return payload.result;
 		} catch (error) {
@@ -316,15 +854,45 @@ class ChromeProfileBridge {
 		}
 	}
 
+
+
 	private enqueue(command: BridgeCommand): void {
 		const waiter = this.waiters.shift();
-		if (waiter) waiter(command);
-		else this.queue.push(command);
+		if (waiter) { waiter(command); return; }
+		if (this.queue.length >= MAX_QUEUE) {
+			// Reject the just-enqueued command via its pending entry instead of silently
+			// dropping. Caller's promise rejects through the regular timer cleanup.
+			const pending = this.pending.get(command.id);
+			if (pending) {
+				clearTimeout(pending.timer);
+				this.pending.delete(command.id);
+				pending.reject(new Error("Chrome bridge queue full; refusing new command"));
+			}
+			return;
+		}
+		this.queue.push(command);
 	}
 
 	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
 		const url = new URL(request.url ?? "/", this.url);
 		const corsHeaders = corsHeadersFor(request);
+		// Loopback enforcement applies to every endpoint, regardless of how the listening host was
+		// configured. Even with PI_CHROME_BRIDGE_DANGEROUS_REMOTE=1 we never accept non-loopback
+		// connections on /next, /result, /command, or /status without future authenticated
+		// transports.
+		if (!isLoopbackAddress(request.socket.remoteAddress ?? undefined)) {
+			sendJson(response, 403, { ok: false, error: "bridge accepts only loopback connections" });
+			return;
+		}
+		// Top-level Content-Length precheck so oversized bodies are 413'd before any auth or
+		// per-endpoint logic runs. Streaming size enforcement in readRequestBody still applies
+		// for chunked requests that omit Content-Length.
+		const declaredLen = Number(request.headers["content-length"]);
+		if (Number.isFinite(declaredLen) && declaredLen > MAX_REQUEST_BODY_BYTES) {
+			sendJson(response, 413, { ok: false, error: "request body too large" });
+			request.resume();
+			return;
+		}
 		if (request.method === "OPTIONS") {
 			if (!isBrowserOriginAllowed(request)) {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
@@ -337,31 +905,124 @@ class ChromeProfileBridge {
 			sendJson(response, 200, this.status());
 			return;
 		}
+		if (request.method === "POST" && url.pathname === "/pair") {
+			// /pair is browser-originated (extension popup posts here). Loopback already enforced.
+			if (!isBrowserOriginAllowed(request)) {
+				sendJson(response, 403, { ok: false, error: "browser origin required" }, corsHeaders);
+				return;
+			}
+			if (!this.auth.pairWindowActive()) {
+				sendJson(response, 403, { ok: false, error: "no active pairing window; run /chrome pair in Pi first" }, corsHeaders);
+				return;
+			}
+			const body = await readJsonBody<{ extensionId?: string; extensionNonce?: string; mac?: string }>(request, response, corsHeaders);
+			if (!body) return;
+			// Pin the extension ID to the one the request originates from, not the body claim.
+			const originExt = this.extensionIdFromOrigin(request);
+			if (!originExt) {
+				sendJson(response, 403, { ok: false, error: "chrome-extension origin required for pair" }, corsHeaders);
+				return;
+			}
+			if (body.extensionId && body.extensionId !== originExt) {
+				sendJson(response, 400, { ok: false, error: "extensionId mismatch with Origin" }, corsHeaders);
+				return;
+			}
+			try {
+				const { response: payload, signedHeader } = this.auth.completePairing({ ...body, extensionId: originExt });
+				sendJson(response, 200, payload, { ...corsHeaders, [AUTH_HEADER]: signedHeader });
+			} catch (error) {
+				sendJson(response, 401, { ok: false, error: (error as Error).message }, corsHeaders);
+			}
+			return;
+		}
 		if (request.method === "POST" && url.pathname === "/command") {
 			if (!isLocalProcessRequest(request)) {
 				sendJson(response, 403, { ok: false, error: "Chrome commands are accepted only from local Pi processes" });
 				return;
 			}
-			const body = JSON.parse(await readRequestBody(request)) as {
-				action?: string;
-				params?: Record<string, unknown>;
-				timeoutMs?: number;
-			};
-			if (!body.action) {
+			if (!this.auth.paired) {
+				sendJson(response, 401, { ok: false, error: "bridge not paired; run /chrome pair" });
+				return;
+			}
+			// Read body first so we can verify the MAC over the exact payload received.
+			const rawBody = await (async () => {
+				try { return await readRequestBody(request); }
+				catch (error) {
+					if (error instanceof RequestBodyTooLargeError) sendJson(response, 413, { ok: false, error: "request body too large" });
+					else sendJson(response, 400, { ok: false, error: `failed to read body: ${(error as Error).message}` });
+					return undefined;
+				}
+			})();
+			if (rawBody === undefined) return;
+			if (!this.auth.verifyPeerRequest("POST", "/command", request.headers[AUTH_HEADER], rawBody)) {
+				sendJson(response, 401, { ok: false, error: "missing or invalid bridge auth header" });
+				return;
+			}
+			let body: { action?: string; params?: Record<string, unknown>; timeoutMs?: number };
+			try { body = JSON.parse(rawBody || "{}"); }
+			catch (error) { sendJson(response, 400, { ok: false, error: `invalid JSON body: ${(error as Error).message}` }); return; }
+			if (!body.action || typeof body.action !== "string") {
 				sendJson(response, 400, { ok: false, error: "Missing command action" });
 				return;
 			}
+			const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || DEFAULT_TIMEOUT_MS, 1_000), 5 * 60_000);
 			try {
-				const result = await this.sendLocal(body.action, body.params ?? {}, body.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-				sendJson(response, 200, { ok: true, result });
+				const result = await this.sendLocal(body.action, body.params ?? {}, timeoutMs);
+				const respBody = JSON.stringify({ ok: true, result });
+				const sigHeader = this.auth.signOwnerResponse("POST", "/command", respBody);
+				response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(sigHeader ? { [AUTH_HEADER]: sigHeader } : {}) });
+				response.end(respBody);
 			} catch (error) {
-				sendJson(response, 504, { ok: false, error: (error as Error).message });
+				const respBody = JSON.stringify({ ok: false, error: (error as Error).message });
+				const sigHeader = this.auth.signOwnerResponse("POST", "/command", respBody);
+				response.writeHead(504, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...(sigHeader ? { [AUTH_HEADER]: sigHeader } : {}) });
+				response.end(respBody);
 			}
 			return;
 		}
 		if (request.method === "GET" && url.pathname === "/next") {
 			if (!isBrowserOriginAllowed(request)) {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
+				return;
+			}
+			const originExt = this.extensionIdFromOrigin(request);
+			const currentVersion = readPiChromeVersion();
+			// Pre-pairing path: return a benign idle response so old/unpaired extensions can still
+			// see the version-mismatch reload hint, but never deliver commands.
+			if (!this.auth.paired) {
+				sendJson(response, 200, { type: "none", needsPairing: true, expectedExtensionVersion: currentVersion },
+					{ ...corsHeaders, "x-pi-chrome-version": currentVersion });
+				return;
+			}
+			// Paired: pin the request origin to the paired extension and require signed envelope.
+			//
+			// We distinguish two failure modes:
+			//   1. Origin not pinned, OR origin pinned but auth header absent. Return 200 idle +
+			//      version header so older extensions that pre-date signed envelopes (no header)
+			//      can still see the version mismatch and auto-reload. They never receive
+			//      commands; this is purely a migration helper.
+			//   2. Pinned origin sent an auth header but it failed verification (bad sig, replayed
+			//      nonce, ts skew). That is an attack signal or a stale-key paired extension; we
+			//      return a hard 401 with the version header so the caller backs off and the user
+			//      sees a clear failure in logs.
+			const hasAuthHeader = Boolean(request.headers[AUTH_HEADER]);
+			if (!originExt || originExt !== this.auth.pinnedExtensionId) {
+				sendJson(response, 200, { type: "none", needsPairing: true, expectedExtensionVersion: currentVersion },
+					{ ...corsHeaders, "x-pi-chrome-version": currentVersion });
+				return;
+			}
+			if (!hasAuthHeader) {
+				sendJson(response, 200, { type: "none", needsPairing: true, expectedExtensionVersion: currentVersion },
+					{ ...corsHeaders, "x-pi-chrome-version": currentVersion });
+				return;
+			}
+			if (!this.auth.verifyExtensionRequest("GET", "/next", request.headers[AUTH_HEADER], originExt, "")) {
+				sendJson(response, 401, { ok: false, error: "invalid /next auth (bad sig, replayed nonce, or stale ts)" },
+					{ ...corsHeaders, "x-pi-chrome-version": currentVersion });
+				return;
+			}
+			if (this.waiters.length >= MAX_WAITERS) {
+				sendJson(response, 429, { ok: false, error: "too many concurrent /next pollers" }, corsHeaders);
 				return;
 			}
 			this.lastSeenAt = Date.now();
@@ -379,21 +1040,22 @@ class ChromeProfileBridge {
 				});
 			}
 			if (aborted) {
-				// Long-poll connection died before we could deliver. Requeue any command we pulled
-				// so the next live /next picks it up instead of dropping it on the floor.
 				if (command) this.queue.unshift(command);
 				return;
 			}
-			// Re-read version on every /next so bumping package.json takes effect without pi restart.
-			const currentVersion = readPiChromeVersion();
-			sendJson(
-				response,
-				200,
-				command
-					? { type: "command", command, expectedExtensionVersion: currentVersion }
-					: { type: "none", expectedExtensionVersion: currentVersion },
-				{ ...corsHeaders, "x-pi-chrome-version": currentVersion },
-			);
+			const payload = command
+				? { type: "command", command, expectedExtensionVersion: currentVersion }
+				: { type: "none", expectedExtensionVersion: currentVersion };
+			const respBody = JSON.stringify(payload);
+			const sigHeader = this.auth.signBridgeResponse("GET", "/next", respBody);
+			response.writeHead(200, {
+				"content-type": "application/json; charset=utf-8",
+				"cache-control": "no-store",
+				...corsHeaders,
+				"x-pi-chrome-version": currentVersion,
+				...(sigHeader ? { [AUTH_HEADER]: sigHeader } : {}),
+			});
+			response.end(respBody);
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/result") {
@@ -401,8 +1063,35 @@ class ChromeProfileBridge {
 				sendJson(response, 403, { ok: false, error: "browser origin not allowed" });
 				return;
 			}
+			if (!this.auth.paired) {
+				sendJson(response, 401, { ok: false, error: "bridge not paired" }, corsHeaders);
+				return;
+			}
+			const originExt = this.extensionIdFromOrigin(request);
+			if (!originExt || originExt !== this.auth.pinnedExtensionId) {
+				sendJson(response, 403, { ok: false, error: "extension origin not pinned" }, corsHeaders);
+				return;
+			}
 			this.lastSeenAt = Date.now();
-			const result = JSON.parse(await readRequestBody(request)) as BridgeResult;
+			// Read raw body, verify MAC over it, then parse.
+			let rawBody: string;
+			try { rawBody = await readRequestBody(request); }
+			catch (error) {
+				if (error instanceof RequestBodyTooLargeError) sendJson(response, 413, { ok: false, error: "request body too large" }, corsHeaders);
+				else sendJson(response, 400, { ok: false, error: `failed to read body: ${(error as Error).message}` }, corsHeaders);
+				return;
+			}
+			if (!this.auth.verifyExtensionRequest("POST", "/result", request.headers[AUTH_HEADER], originExt, rawBody)) {
+				sendJson(response, 401, { ok: false, error: "invalid /result auth" }, corsHeaders);
+				return;
+			}
+			let result: BridgeResult;
+			try { result = JSON.parse(rawBody || "{}") as BridgeResult; }
+			catch (error) { sendJson(response, 400, { ok: false, error: `invalid JSON: ${(error as Error).message}` }, corsHeaders); return; }
+			if (!result.id || typeof result.id !== "string") {
+				sendJson(response, 400, { ok: false, error: "missing command id" }, corsHeaders);
+				return;
+			}
 			const pending = this.pending.get(result.id);
 			if (!pending) {
 				sendJson(response, 404, { ok: false, error: "unknown command id" }, corsHeaders);
@@ -486,6 +1175,16 @@ export default function (pi: ExtensionAPI): void {
 		}
 	};
 
+	// Status bar reflects whether chrome_* tools are currently usable for this session. We only
+	// surface the indicator when authorized so an idle pi-chrome doesn't take up footer space.
+	const updateChromeStatus = (ctx: ExtensionContext): void => {
+		if (chromeControlAuthorized()) {
+			ctx.ui.setStatus("chrome", `${ctx.ui.theme.fg("success", "●")} Chrome Bridge`);
+		} else {
+			ctx.ui.setStatus("chrome", undefined);
+		}
+	};
+
 	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
 		return bridge.send(action, params, timeoutMs, signal);
@@ -507,14 +1206,11 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await bridge.start();
-		const status = bridge.status();
-		ctx.ui.setStatus("chrome", `Chrome bridge :${DEFAULT_PORT}`);
-		ctx.ui.notify(
-			status.mode === "client"
-				? `pi-chrome connected (sharing the Chrome connection an earlier pi session opened). Run /chrome authorize before using chrome_* tools.`
-				: `pi-chrome is ready and waiting for the Chrome companion to connect. Run /chrome onboard to install it, then /chrome authorize to allow chrome_* tools.`,
-			"info",
-		);
+		// No setup notify or always-on status entry. Onboarding (/chrome onboard) and pairing
+		// (/chrome pair) print actionable instructions when invoked; surfacing them at every
+		// session_start was noisy for users who weren't using chrome_* tools that session. The
+		// status bar lights up only after /chrome authorize.
+		updateChromeStatus(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -536,7 +1232,7 @@ Capability model (important):
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
-1. If a chrome_* tool says Chrome control is locked, ask the user to run \`/chrome authorize\` before retrying.
+1. If a chrome_* tool says Chrome control is locked or the bridge is not paired, ask the user to run \`/chrome pair\` (one-time) and \`/chrome authorize\` before retrying.
 2. \`chrome_snapshot\` before clicking/typing; pass \`uid\` over \`selector\`.
 3. \`includeSnapshot=true\` on click/type/fill/key to verify in one round trip.
 4. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
@@ -555,6 +1251,11 @@ Usage rules:
 			const status = bridge.status();
 			const roleLabel = status.mode === "client" ? "sharing another pi session's connection" : "running the Chrome connection for this machine";
 			lines.push(`• This pi session is ${roleLabel}.`);
+			if (bridge.bridgeAuth.paired) {
+				lines.push(`✓ Bridge paired with extension ${bridge.bridgeAuth.pinnedExtensionId} (bridgeId ${bridge.bridgeAuth.bridgeId}).`);
+			} else {
+				lines.push("✗ Bridge not yet paired with the Chrome extension. Run /chrome pair, paste the invite into the extension popup, then re-run /chrome doctor.");
+			}
 			let extensionAlive = false;
 			let versionMismatch = false;
 			try {
@@ -650,6 +1351,7 @@ Usage rules:
 		}
 		chromeAuthorizedUntil = until;
 		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
+		updateChromeStatus(ctx);
 	};
 
 	const parseAuthorizeArg = (arg: string): { label: string; until: number | "indefinite" } | undefined => {
@@ -671,26 +1373,183 @@ Usage rules:
 
 	const revokeHandler = (ctx: ExtensionContext) => {
 		chromeAuthorizedUntil = undefined;
+		updateChromeStatus(ctx);
 		ctx.ui.notify("Chrome control locked. Run /chrome authorize to allow chrome_* tools again.", "info");
 	};
 
-	const onboardHandler = async (ctx: ExtensionContext) => {
-		const extensionPath = browserExtensionPath();
-		const proceed = await ctx.ui.confirm(
-			"Install the pi-chrome Chrome extension?",
-			`This opens Chrome's extensions page and reveals the folder pi-chrome needs you to load.\n\nWhen the windows open, in Chrome:\n  1. Turn on 'Developer mode' (top-right toggle).\n  2. Click 'Load unpacked' and choose the folder that just opened in Finder, or paste this path:\n     ${extensionPath}\n\nPress Enter to continue, or Esc to cancel.`,
-		);
-		if (!proceed) {
-			ctx.ui.notify("Cancelled. You can run /chrome onboard again whenever you're ready.", "info");
+	// `/chrome pair` is the bare-bones pairing step, useful when the extension is already
+	// installed and you just need to re-arm or re-pair. First-time setup should use
+	// /chrome onboard which wraps this with installation guidance.
+	const pairHandler = async (ctx: ExtensionContext) => {
+		if (bridge.status().mode === "client") {
+			ctx.ui.notify(
+				"This Pi session is sharing another session's Chrome bridge. Run /chrome pair from the Pi session that owns the bridge (the first one started in this cwd).",
+				"warning",
+			);
 			return;
 		}
+		if (bridge.bridgeAuth.paired) {
+			const replace = await ctx.ui.confirm(
+				"Re-pair Chrome bridge?",
+				"The bridge is already paired with a Chrome extension. Re-pairing will invalidate the current keys and you'll need to re-paste the new invite into the extension popup.\n\nPress Enter to continue, or Esc to cancel.",
+			);
+			if (!replace) { ctx.ui.notify("Pairing cancelled.", "info"); return; }
+			bridge.bridgeAuth.reset();
+		}
+		const invite = bridge.bridgeAuth.startPairWindow();
+		await copyToClipboard(ctx, invite);
+		ctx.ui.notify(
+			[
+				"Pairing invite (also copied to clipboard):",
+				"",
+				`    ${invite}`,
+				"",
+				"In Chrome, click the Pi Chrome Connector toolbar icon, paste this invite, and click 'Pair'.",
+				`Invite expires in ${Math.round(PAIR_WINDOW_MS / 60_000)} minutes. After pairing, run /chrome authorize to allow chrome_* tools.`,
+			].join("\n"),
+			"info",
+		);
+	};
+
+	const unpairHandler = async (ctx: ExtensionContext) => {
+		// Mirror of /chrome pair: only the bridge owner can authoritatively unpair. A peer that
+		// rewrites the shared config file would leave the owner's in-memory keys intact, and
+		// commands would keep flowing until the owner restarts.
+		if (bridge.status().mode === "client") {
+			ctx.ui.notify(
+				"This Pi session is sharing another session's Chrome bridge. Run /chrome unpair from the owner Pi session (the first one started in this cwd).",
+				"warning",
+			);
+			return;
+		}
+		if (!bridge.bridgeAuth.paired) {
+			ctx.ui.notify("pi-chrome is not currently paired.", "info");
+			return;
+		}
+		const proceed = await ctx.ui.confirm(
+			"Unpair Chrome bridge?",
+			"This clears the stored extension ID + HMAC keys. Every Pi session will need to re-pair (and the Chrome extension popup will need to be re-armed).\n\nPress Enter to confirm, or Esc to cancel.",
+		);
+		if (!proceed) { ctx.ui.notify("Unpair cancelled.", "info"); return; }
+		bridge.bridgeAuth.reset();
+		ctx.ui.notify("pi-chrome unpaired. Run /chrome pair to start a new pairing.", "info");
+	};
+
+	const copyToClipboard = async (ctx: ExtensionContext, text: string): Promise<void> => {
 		if (process.platform === "darwin") {
-			await pi.exec("open", ["-a", "Google Chrome", "chrome://extensions"], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
-			await pi.exec("open", ["-R", extensionPath], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
-			await pi.exec("sh", ["-lc", `printf %s ${JSON.stringify(extensionPath)} | pbcopy`], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+			await pi.exec("sh", ["-lc", `printf %s ${JSON.stringify(text)} | pbcopy`], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+		} else if (process.platform === "linux") {
+			await pi.exec("sh", ["-lc", `printf %s ${JSON.stringify(text)} | (xclip -selection clipboard 2>/dev/null || xsel --clipboard --input 2>/dev/null || wl-copy 2>/dev/null) || true`], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+		}
+	};
+
+	// `/chrome onboard` walks the user end-to-end through the only setup that matters: install
+	// the Chrome extension, then pair it with this Pi bridge. Pairing was previously a separate
+	// `/chrome pair` step that users frequently forgot, so we inline it here. Returning users
+	// who only need to re-install the extension can skip the pair step when prompted; users who
+	// only need to re-pair an already-installed extension can call `/chrome pair` directly.
+	const onboardHandler = async (ctx: ExtensionContext) => {
+		if (bridge.status().mode === "client") {
+			ctx.ui.notify(
+				"This Pi session is sharing another session's Chrome bridge. Run /chrome onboard from the Pi session that owns the bridge (the first one started in this cwd).",
+				"warning",
+			);
+			return;
+		}
+		const extensionPath = browserExtensionPath();
+
+		// --- Step 1: install / reload the Chrome extension. -------------------------------
+		const alreadyConnected = await bridge.send("tab.version", {}, 3_000).then(() => true).catch(() => false);
+		let installStep: "install" | "skip" = "install";
+		if (alreadyConnected) {
+			const keep = await ctx.ui.confirm(
+				"Chrome extension already connected",
+				"Skip the install step and jump straight to pairing? (Press Esc to re-install the extension instead.)",
+			);
+			if (keep) installStep = "skip";
+		}
+
+		if (installStep === "install") {
+			const proceed = await ctx.ui.confirm(
+				"Step 1 of 2: install the Chrome extension",
+				[
+					`pi-chrome will open Chrome's extensions page and reveal the extension folder in Finder.`,
+					``,
+					`In Chrome:`,
+					`  1. Turn on 'Developer mode' (top-right toggle).`,
+					`  2. Click 'Load unpacked' and pick the folder that opens in Finder, or paste this path (it's on your clipboard):`,
+					`     ${extensionPath}`,
+					``,
+					`Press Enter to continue, or Esc to cancel.`,
+				].join("\n"),
+			);
+			if (!proceed) {
+				ctx.ui.notify("Cancelled. Run /chrome onboard again whenever you're ready.", "info");
+				return;
+			}
+			if (process.platform === "darwin") {
+				await pi.exec("open", ["-a", "Google Chrome", "chrome://extensions"], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+				await pi.exec("open", ["-R", extensionPath], { cwd: workspaceCwd(ctx), timeout: 5_000 }).catch(() => undefined);
+			}
+			await copyToClipboard(ctx, extensionPath);
+			ctx.ui.notify(
+				"Chrome and Finder should be open; the extension folder path is on your clipboard. After Chrome shows 'Pi Chrome Connector', press Enter to continue.",
+				"info",
+			);
+			const ready = await ctx.ui.confirm(
+				"Extension loaded?",
+				"Confirm once 'Pi Chrome Connector' appears in chrome://extensions. Press Esc to abort if it didn't load.",
+			);
+			if (!ready) {
+				ctx.ui.notify("Cancelled before pairing. Run /chrome onboard again, or /chrome pair if you load the extension later.", "info");
+				return;
+			}
+		}
+
+		// --- Step 2: pair. ---------------------------------------------------------------
+		if (bridge.bridgeAuth.paired) {
+			const rePair = await ctx.ui.confirm(
+				"Bridge is already paired",
+				"Re-pair with this freshly-installed extension? The previous pairing will be invalidated and any other Pi sessions sharing this bridge will need /chrome authorize again.\n\nPress Enter to re-pair, Esc to keep the existing pairing.",
+			);
+			if (!rePair) {
+				ctx.ui.notify("Kept existing pairing. Run /chrome authorize to allow chrome_* tools.", "info");
+				return;
+			}
+			bridge.bridgeAuth.reset();
+		}
+		const invite = bridge.bridgeAuth.startPairWindow();
+		await copyToClipboard(ctx, invite);
+		ctx.ui.notify(
+			[
+				"Step 2 of 2: pair the extension with this Pi bridge.",
+				"",
+				"  1. Click the Pi Chrome Connector icon in Chrome's toolbar (the puzzle piece, then pin it if needed).",
+				"  2. Paste the invite below into the popup and click 'Pair'.",
+				"",
+				`  Invite (also on your clipboard):  ${invite}`,
+				"",
+				`  Expires in ${Math.round(PAIR_WINDOW_MS / 60_000)} minutes.`,
+			].join("\n"),
+			"info",
+		);
+		const paired = await ctx.ui.confirm(
+			"Wait for pairing",
+			"Press Enter once the extension popup says 'Paired with bridge …'. Press Esc to abort — invite stays armed for the rest of the window so you can call /chrome pair later.",
+		);
+		if (!paired) {
+			ctx.ui.notify("Onboarding paused. Invite is still armed; run /chrome pair or paste again later.", "info");
+			return;
+		}
+		if (!bridge.bridgeAuth.paired) {
+			ctx.ui.notify(
+				"Pi side still shows the bridge as unpaired. The invite may not have been pasted yet, or the extension may not be loaded. Re-run /chrome onboard, or run /chrome doctor for diagnostics.",
+				"warning",
+			);
+			return;
 		}
 		ctx.ui.notify(
-			"Chrome and Finder should be open. The extension folder path is on your clipboard. After you click 'Load unpacked' and pick it, run /chrome doctor to confirm everything is connected.",
+			"✓ Pairing complete. Next step: run /chrome authorize 15m (or longer) before using chrome_* tools.",
 			"info",
 		);
 	};
@@ -776,7 +1635,7 @@ Usage rules:
 
 	pi.registerCommand("chrome", {
 		description:
-			"All pi-chrome controls in one place.\n  /chrome authorize [15m|30m|<minutes>|indefinite] — allow this Pi session to use chrome_* tools.\n  /chrome revoke   — lock Chrome control.\n  /chrome status   — one-line snapshot of connection, auth, and background setting.\n  /chrome doctor   — full health check.\n  /chrome onboard  — install the Chrome companion extension.\n  /chrome background [on|off|status|toggle] — whether pi-chrome runs without focusing Chrome.\nRun with no arguments for an interactive picker that shows current state.",
+			"All pi-chrome controls in one place.\n\n  First-time setup (do these once, in this order):\n    /chrome onboard  — install the Chrome extension AND pair it with this Pi bridge.\n    /chrome authorize [15m|30m|<minutes>|indefinite] — unlock chrome_* tools for this Pi session.\n\n  Day-to-day:\n    /chrome authorize — unlock chrome_* tools (per session).\n    /chrome revoke    — lock chrome_* tools again.\n    /chrome status    — one-line snapshot of connection, auth, and background setting.\n    /chrome doctor    — full health check; tells you exactly what's missing.\n\n  Maintenance (rare):\n    /chrome pair      — (re-)pair the extension when only pairing is missing.\n    /chrome unpair    — clear pairing keys; every Pi session will need to re-pair.\n    /chrome background [on|off|status|toggle] — run without focusing Chrome.\n\nRun with no arguments for an interactive picker that shows current state.",
 		getArgumentCompletions: (prefix) => {
 			const raw = prefix;
 			const trimmedRight = raw.replace(/\s+$/, "");
@@ -793,11 +1652,13 @@ Usage rules:
 			let candidates: Item[] = [];
 			if (path.length === 0) {
 				candidates = [
-					{ fullValue: "authorize", label: "authorize", description: "Allow this Pi session to use chrome_* tools." },
-					{ fullValue: "revoke", label: "revoke", description: "Lock Chrome control for this Pi session." },
+					{ fullValue: "onboard", label: "onboard", description: "First-time setup: install the Chrome extension + pair it (run this once, then /chrome authorize)." },
+					{ fullValue: "authorize", label: "authorize", description: "Unlock chrome_* tools for this Pi session." },
+					{ fullValue: "revoke", label: "revoke", description: "Lock chrome_* tools again." },
 					{ fullValue: "status", label: "status", description: "One-line summary: connection, auth, and background setting." },
-					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you if Chrome is connected and what's wrong if it isn't." },
-					{ fullValue: "onboard", label: "onboard", description: "Install the Chrome companion extension (first-time setup)." },
+					{ fullValue: "doctor", label: "doctor", description: "Full health check. Tells you exactly what's missing if chrome_* isn't working." },
+					{ fullValue: "pair", label: "pair", description: "Re-pair an already-installed extension (use /chrome onboard for first-time setup)." },
+					{ fullValue: "unpair", label: "unpair", description: "Clear pairing keys (forces every Pi session to re-pair)." },
 					{ fullValue: "background", label: "background", description: "Run pi-chrome in the background without focusing Chrome?" },
 				];
 			} else if (path[0] === "authorize" && path.length === 1) {
@@ -828,6 +1689,8 @@ Usage rules:
 			const [head, ...rest] = tokens;
 			const subArgs = rest.join(" ");
 			switch (head) {
+				case "pair": return pairHandler(ctx);
+				case "unpair": return unpairHandler(ctx);
 				case "authorize": return authorizeHandler(ctx, subArgs);
 				case "revoke": return revokeHandler(ctx);
 				case "status": return statusHandler(ctx);

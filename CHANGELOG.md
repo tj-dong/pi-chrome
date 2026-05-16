@@ -2,6 +2,53 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.16.0 — 2026-05-16
+
+### Onboarding UX (same release)
+
+- **`/chrome onboard` now runs both install + pair in one flow.** Two-step interactive walkthrough: (1) install/reload the Chrome extension (with auto-open of `chrome://extensions` + Finder + clipboard on macOS), (2) mint an invite, copy to clipboard, and wait for the user to paste into the extension popup. Returning users with an already-connected extension can skip step 1; users with an existing pairing get an explicit re-pair prompt. Pairing is no longer a separate step users have to remember.
+- **`/chrome` command help reorganized** into First-time setup / Day-to-day / Maintenance groups so `onboard → authorize` is the obvious path.
+- **Linux clipboard support** in the onboard/pair flow (tries `xclip` → `xsel` → `wl-copy`). macOS still uses `pbcopy`. Other platforms surface the invite text only; user copies manually.
+- **README rewritten** with the install-then-pair flow front and center, a new "Why pairing?" section explaining the threat model in plain English, and a command-reference table.
+
+### Ported from fork DaniBedz/pi-chrome (same release)
+
+- **Early console/network capture at document_start.** Previously `chrome_list_console_messages` and `chrome_list_network_requests` returned empty for errors and requests fired during initial page load, because instrumentation only installed lazily when a chrome_* tool first ran. A new `chrome.webNavigation.onCommitted` listener now injects a self-contained `installEarlyCapture()` into MAIN world with `injectImmediately:true`, wrapping `console.{debug,log,info,warn,error}`, `fetch`, and `XMLHttpRequest` plus `error`/`unhandledrejection` listeners before the page's own code runs. Same `window.__PI_CHROME_STATE__` schema as the lazy path; idempotent via `__piChromeWrapped`. Boot-time React errors and initial API calls now appear in the console/network logs.
+- **Quieter startup + dynamic status bar.** Removed the `session_start` info notify and the always-on `Chrome bridge :17318` status entry. The status bar now lights up as a green ● only after `/chrome authorize`, and clears on `/chrome revoke`. Onboarding (`/chrome onboard`) and pairing (`/chrome pair`) still print actionable instructions when invoked.
+
+### Test-driven follow-ups (same release)
+
+- **Paired `/next` distinguishes attack signal from migration.** With a paired bridge, a pinned origin that sends a present-but-invalid auth header (bad sig, replayed nonce, or stale ts) now gets a hard `401` instead of `200 needsPairing`. Missing-header from any chrome-extension origin still returns the soft migration response (so older unsigned extensions can read the version header and auto-reload). SW handles the new 401 by surfacing the pair badge and backing off; no exception throw, no auto-clear of keys.
+- **Owner re-reads pairing state on every privileged request.** `BridgeAuth.refreshIfStale()` stats `~/.config/pi/chrome-bridge.json` and reloads if mtime changed (microseconds when unchanged), so cross-process mutations of the file — e.g. a peer running `/chrome unpair`, or an external `rm` — propagate immediately to the owner's in-memory state. Replay caches are dropped on key rotation. An `fs.watch` on the config directory is also installed as a prompt secondary signal; the per-request mtime check guarantees correctness even if the watch is missed.
+
+### Red-team review follow-ups (same release)
+
+- **CORS now allows/exposes the auth header** (`x-pi-chrome-auth`). Without this, some `fetch` implementations strip it on cross-origin extension responses.
+- **Renamed header from `x-pi-pi-auth` to `x-pi-chrome-auth`.** Internal-only rename before any 0.16.x release.
+- **`brokerKey` no longer leaves the Pi-side config.** The `/pair` response only returns `extensionPairKey`. Compromised extensions therefore can't extract the broker key used for peer-Pi `/command`.
+- **Replay defense on response paths.** Added per-direction LRU nonce caches for `bridge->ext` (extension side) and `owner->peer` (peer-Pi side). The signature spec already covered these directions; the caches now actually enforce single-use nonces.
+- **`reset()` and `persist()` chmod existing files.** `writeFileSync(mode)` is a no-op on an existing file; we now `chmodSync` to `0600` (and parent dir `0700`) on every write.
+- **`readJsonBody` rejects non-object JSON** (null/array/string) with 400 instead of letting it through.
+- **Top-level Content-Length precheck.** Oversized requests are 413'd before any auth/per-endpoint logic runs.
+- **Stale-auth handling on the extension side.** When `/chrome unpair` is run on the Pi and the extension still has cached keys, the SW no longer loops on "bad /next signature". The unsigned-idle `{type:"none", needsPairing:true}` shape is accepted without a signature *only* when the bridge sends no auth header (never with a command), so the pair badge is surfaced and the user re-pairs from the popup.
+
+### Original 0.16.0 changes
+
+### Security hardening (red-team driven)
+
+- **Mandatory pairing.** New `/chrome pair` issues a one-time invite the user pastes into the Chrome extension popup. Pairing pins the exact `chrome-extension://<id>` origin and derives HMAC keys via HKDF. Until paired, the bridge returns idle responses and refuses to deliver commands. `/chrome unpair` resets.
+- **Signed envelopes on every privileged endpoint.** `/next`, `/result`, and `/command` now require an `X-Pi-Pi-Auth: v1 ts=... nonce=... sig=...` header signing protocol version, direction, method, path, extension ID, bridge ID, timestamp, nonce, and SHA-256 of the body. ±30 s clock window, 5-min LRU nonce replay defense, constant-time MAC compare. Bridge responses are signed too; the extension and peer Pi sessions verify before accepting commands or results.
+- **Peer Pi sessions no longer ship a bearer token.** `/command` between Pi processes uses per-request signatures keyed by the broker HKDF key, and the owner's response is signed for verification. A pre-bind impostor without the pairing secret cannot impersonate or extract the keys.
+- **Global loopback enforcement.** Every endpoint rejects non-loopback `remoteAddress`. `PI_CHROME_BRIDGE_HOST=0.0.0.0` is ignored unless `PI_CHROME_BRIDGE_DANGEROUS_REMOTE=1` is set, and even then the loopback check still applies.
+- **Resource caps.** 1 MiB body cap (413), 256 queued/pending commands, 4 concurrent `/next` long-pollers (429). Malformed JSON now returns 400 instead of 500.
+- **`crypto.randomUUID()` for command IDs** (was `Date.now()+Math.random()`).
+- **`page.navigate` initScript** is now wrapped in `try/finally` around `chrome.tabs.update` and deleted in `onCommitted` *before* injection, so an aborted navigation cannot leave a stale init script armed for the next URL the user visits in that tab.
+- **Manifest diet.** Dropped unused `activeTab` permission. Added popup UI (`popup.html` / `popup.js`) for pasting the pairing invite.
+
+### Migration
+
+Existing installations must run `/chrome pair` once after upgrading. Old extensions in the field receive a benign idle response plus the `x-pi-chrome-version` header, which still triggers the existing auto-reload path; the reloaded extension then surfaces a `pair` action badge.
+
 ## 0.15.20 — 2026-05-15
 
 - **Interruptible `chrome_*` tools.** All `chrome_*` tools now honor the agent harness `AbortSignal`, so pressing Esc aborts in-flight bridge calls (including the long-polling `chrome_wait_for`) immediately instead of waiting out the full `timeoutMs`.

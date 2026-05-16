@@ -3,6 +3,215 @@ const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
 let polling = false;
 
+// =================== Bridge auth (signed envelopes v1) ===================
+//
+// Persisted in chrome.storage.local under PI_CHROME_AUTH_KEY:
+//   { protocol:"v1", bridgeId, extensionId, extensionPairKey }
+// extensionPairKey is a base64url-encoded 32-byte HMAC-SHA256 secret used to sign /next and
+// /result. The brokerKey (used between peer Pi sessions) lives only in the Pi-side config and
+// is intentionally never sent to the browser.
+//
+// Wire format and canonical signing string match the Pi-side BridgeAuth contract in
+// extensions/chrome-profile-bridge/index.ts. Until the extension is paired, the service
+// worker only contacts /next (which returns {needsPairing:true}) and the popup-driven /pair
+// endpoint; it never dispatches commands.
+
+const PI_CHROME_AUTH_KEY = "piChromeAuthV1";
+const AUTH_HEADER = "x-pi-chrome-auth";
+let authStateCache = null; // in-memory mirror to avoid awaiting storage on every poll
+
+async function loadAuthState() {
+  if (authStateCache) return authStateCache;
+  try {
+    const stored = await chrome.storage.local.get(PI_CHROME_AUTH_KEY);
+    const value = stored[PI_CHROME_AUTH_KEY];
+    if (value && value.protocol === "v1" && value.bridgeId && value.extensionId && value.extensionPairKey) {
+      authStateCache = value;
+      return value;
+    }
+  } catch (error) {
+    console.warn("[pi-chrome] failed to read auth state:", error);
+  }
+  return null;
+}
+async function saveAuthState(state) {
+  authStateCache = state;
+  await chrome.storage.local.set({ [PI_CHROME_AUTH_KEY]: state });
+}
+async function clearAuthState() {
+  authStateCache = null;
+  await chrome.storage.local.remove(PI_CHROME_AUTH_KEY);
+}
+function b64urlEncode(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(text) {
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (text.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function sha256Hex(text) {
+  const buf = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  const bytes = new Uint8Array(digest);
+  let hex = "";
+  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  return hex;
+}
+async function importHmacKey(b64urlKey) {
+  return crypto.subtle.importKey("raw", b64urlDecode(b64urlKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+async function hmacSignBytes(key, message) {
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return new Uint8Array(sig);
+}
+function canonicalString(direction, method, path, extensionId, bridgeId, ts, nonce, bodyHash) {
+  return ["v1", direction, method.toUpperCase(), path, extensionId, bridgeId, String(ts), nonce, bodyHash].join("\n");
+}
+async function buildAuthHeader(keyB64, direction, method, path, extensionId, bridgeId, body) {
+  const ts = Date.now();
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(16));
+  const nonce = b64urlEncode(nonceBytes);
+  const bodyHash = await sha256Hex(body);
+  const key = await importHmacKey(keyB64);
+  const sig = await hmacSignBytes(key, canonicalString(direction, method, path, extensionId, bridgeId, ts, nonce, bodyHash));
+  return `v1 ts=${ts} nonce=${nonce} sig=${b64urlEncode(sig)}`;
+}
+function parseAuthHeader(value) {
+  if (!value || typeof value !== "string") return null;
+  const parts = value.trim().split(/\s+/);
+  if (parts.length !== 4 || parts[0] !== "v1") return null;
+  const kv = {};
+  for (const p of parts.slice(1)) {
+    const eq = p.indexOf("=");
+    if (eq <= 0) return null;
+    kv[p.slice(0, eq)] = p.slice(eq + 1);
+  }
+  const ts = Number(kv.ts);
+  if (!Number.isFinite(ts) || !kv.nonce || !kv.sig) return null;
+  return { ts, nonce: kv.nonce, sig: kv.sig };
+}
+// Bounded LRU nonce cache for bridge->ext responses (captured /next cannot be replayed at
+// this extension). Map iteration order = insertion order; evict the oldest entry on overflow
+// regardless of staleness.
+const responseNonceCache = new Map();
+const RESPONSE_NONCE_TTL_MS = 5 * 60_000;
+const RESPONSE_NONCE_MAX = 4096;
+function hasResponseNonce(nonce) { return responseNonceCache.has(nonce); }
+function storeResponseNonce(nonce, ts) {
+  const now = Date.now();
+  for (const [k, t] of responseNonceCache) {
+    if (now - t > RESPONSE_NONCE_TTL_MS) responseNonceCache.delete(k); else break;
+  }
+  while (responseNonceCache.size >= RESPONSE_NONCE_MAX) {
+    const oldest = responseNonceCache.keys().next().value;
+    if (oldest === undefined) break;
+    responseNonceCache.delete(oldest);
+  }
+  responseNonceCache.set(nonce, ts);
+}
+async function verifyBridgeResponse(keyB64, direction, method, path, extensionId, bridgeId, headerValue, body) {
+  const parsed = parseAuthHeader(headerValue);
+  if (!parsed) return false;
+  if (Math.abs(Date.now() - parsed.ts) > 30_000) return false;
+  if (hasResponseNonce(parsed.nonce)) return false;
+  const bodyHash = await sha256Hex(body);
+  const key = await importHmacKey(keyB64);
+  const ok = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    b64urlDecode(parsed.sig),
+    new TextEncoder().encode(canonicalString(direction, method, path, extensionId, bridgeId, parsed.ts, parsed.nonce, bodyHash)),
+  );
+  if (!ok) return false;
+  storeResponseNonce(parsed.nonce, parsed.ts);
+  return true;
+}
+
+// Popup-driven pairing entrypoint. Receives the user-pasted invite, derives the MAC, posts
+// /pair, then stores the keys returned by the bridge. Fails closed.
+async function performPairing(inviteToken) {
+  if (!inviteToken || !inviteToken.startsWith("pcp_")) throw new Error("invite must look like pcp_...");
+  const inviteRaw = inviteToken.slice(4);
+  let inviteKey;
+  try { inviteKey = await importHmacKey(inviteRaw); }
+  catch { throw new Error("invite token is not valid base64url"); }
+  const extensionId = chrome.runtime.id;
+  const extensionNonceBytes = crypto.getRandomValues(new Uint8Array(16));
+  const extensionNonce = b64urlEncode(extensionNonceBytes);
+  const macBytes = await hmacSignBytes(inviteKey, `pair-v1|${extensionId}|${extensionNonce}`);
+  const body = JSON.stringify({ extensionId, extensionNonce, mac: b64urlEncode(macBytes) });
+  const response = await fetch(`${BRIDGE_URL}/pair`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let msg = `pair failed: HTTP ${response.status}`;
+    try { msg = `pair failed: ${JSON.parse(text).error || msg}`; } catch {}
+    throw new Error(msg);
+  }
+  // Verify the bridge signed its response with the invite secret — proves we're talking to
+  // the same Pi process that issued the invite, not a localhost impostor.
+  const authHeader = response.headers.get(AUTH_HEADER);
+  const parsed = parseAuthHeader(authHeader);
+  if (!parsed) throw new Error("bridge response missing or invalid auth header");
+  // Clock skew check on the pair response too, for consistency with the rest of the protocol.
+  if (Math.abs(Date.now() - parsed.ts) > 30_000) throw new Error("bridge response timestamp outside ±30 s window");
+  const bodyHash = await sha256Hex(text);
+  const ok = await crypto.subtle.verify(
+    "HMAC",
+    inviteKey,
+    b64urlDecode(parsed.sig),
+    new TextEncoder().encode(canonicalString("bridge->ext", "POST", "/pair", extensionId, JSON.parse(text).bridgeId, parsed.ts, parsed.nonce, bodyHash)),
+  );
+  if (!ok) throw new Error("bridge response signature did not verify");
+  const payload = JSON.parse(text);
+  if (!payload.ok || !payload.bridgeId || !payload.extensionPairKey) {
+    throw new Error("pair response missing fields");
+  }
+  // Intentionally NOT storing brokerKey — the bridge no longer returns it. The extension
+  // only needs extensionPairKey for /next and /result.
+  await saveAuthState({
+    protocol: "v1",
+    bridgeId: payload.bridgeId,
+    extensionId,
+    extensionPairKey: payload.extensionPairKey,
+  });
+  return { bridgeId: payload.bridgeId, extensionId };
+}
+
+// Message bridge for popup.html.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  (async () => {
+    if (message?.type === "pi-chrome-pair") {
+      try {
+        const info = await performPairing(message.invite);
+        sendResponse({ ok: true, info });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message ?? String(error) });
+      }
+      return;
+    }
+    if (message?.type === "pi-chrome-status") {
+      const state = await loadAuthState();
+      sendResponse({ ok: true, paired: Boolean(state), extensionId: chrome.runtime.id, bridgeId: state?.bridgeId ?? null });
+      return;
+    }
+    if (message?.type === "pi-chrome-unpair") {
+      await clearAuthState();
+      sendResponse({ ok: true });
+      return;
+    }
+  })();
+  return true; // async response
+});
+
 // =================== Chrome input (CDP) layer ===================
 // Tracks which tabs we have attached chrome.debugger to.
 const attachedTabs = new Map(); // tabId -> { detachAt: number, pointer: {x,y} }
@@ -627,10 +836,16 @@ async function pollLoop() {
   polling = true;
   try {
     while (true) {
+      const auth = await loadAuthState();
+      const headers = { "cache-control": "no-store" };
+      if (auth) {
+        headers[AUTH_HEADER] = await buildAuthHeader(auth.extensionPairKey, "ext->bridge", "GET", "/next", auth.extensionId, auth.bridgeId, "");
+      }
       const response = await fetch(`${BRIDGE_URL}/next?name=${encodeURIComponent(CLIENT_NAME)}`, {
         cache: "no-store",
+        headers,
       });
-      if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
+      // Even unpaired we honor version-mismatch reload so older extensions auto-update.
       const expected = response.headers.get("x-pi-chrome-version");
       const ours = chrome.runtime.getManifest().version;
       if (expected && expected !== ours && isVersionOlder(ours, expected)) {
@@ -638,8 +853,60 @@ async function pollLoop() {
         try { chrome.runtime.reload(); } catch {}
         return;
       }
-      const payload = await response.json();
-      if (payload.type === "command") await handleCommand(payload.command);
+      if (response.status === 401) {
+        // Paired-but-stale: our stored extensionPairKey no longer matches what the bridge
+        // expects (most likely the user ran /chrome unpair then /chrome pair again with a
+        // different extension instance or invite). Surface the pair badge and back off,
+        // identical to the bridge-returned needsPairing path. Do NOT auto-clear stored
+        // auth — user must explicitly unpair via the popup.
+        try { chrome.action.setBadgeText({ text: "pair" }); chrome.action.setBadgeBackgroundColor({ color: "#d97706" }); } catch {}
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      }
+      if (!response.ok) throw new Error(`bridge /next HTTP ${response.status}`);
+      const text = await response.text();
+      let payload;
+      try { payload = JSON.parse(text); } catch { throw new Error("bad /next JSON"); }
+      // Unsigned-idle path: the bridge always returns an unsigned `{type:"none", needsPairing:true}`
+      // when it has no pinned extension or no matching auth. Even a paired-but-stale extension
+      // (e.g. user ran `/chrome unpair` on the Pi side) must keep polling and surface the
+      // pair badge instead of looping on "bad signature". Only accept this shape unsigned.
+      const sigHeader = response.headers.get(AUTH_HEADER);
+      const unsignedIdle = !sigHeader && payload.type === "none" && payload.needsPairing === true;
+      if (auth && !unsignedIdle) {
+        const okSig = await verifyBridgeResponse(
+          auth.extensionPairKey,
+          "bridge->ext",
+          "GET",
+          "/next",
+          auth.extensionId,
+          auth.bridgeId,
+          sigHeader,
+          text,
+        );
+        if (!okSig) {
+          console.warn("[pi-chrome] /next response signature invalid; refusing command and dropping connection");
+          throw new Error("bad /next signature");
+        }
+      }
+      if (payload.needsPairing) {
+        // Bridge has not been paired (or our stored keys no longer match). Surface via badge
+        // so the user opens the popup; back off so we don't spin. Do NOT auto-clear stored
+        // auth — user must explicitly unpair via the popup.
+        try { chrome.action.setBadgeText({ text: "pair" }); chrome.action.setBadgeBackgroundColor({ color: "#d97706" }); } catch {}
+        await sleep(POLL_ERROR_BACKOFF_MS);
+        continue;
+      } else {
+        try { chrome.action.setBadgeText({ text: "" }); } catch {}
+      }
+      if (payload.type === "command") {
+        if (!auth) {
+          // Bridge sent a command but we have no key to verify or sign /result. Refuse.
+          console.warn("[pi-chrome] command received but extension is not paired; refusing");
+          continue;
+        }
+        await handleCommand(payload.command, auth);
+      }
     }
   } catch (error) {
     await sleep(POLL_ERROR_BACKOFF_MS);
@@ -648,20 +915,22 @@ async function pollLoop() {
   }
 }
 
-async function handleCommand(command) {
+async function handleCommand(command, auth) {
   try {
     const result = await dispatch(command.action, command.params ?? {});
-    await postResult({ id: command.id, ok: true, result });
+    await postResult({ id: command.id, ok: true, result }, auth);
   } catch (error) {
-    await postResult({ id: command.id, ok: false, error: error?.message ?? String(error) });
+    await postResult({ id: command.id, ok: false, error: error?.message ?? String(error) }, auth);
   }
 }
 
-async function postResult(result) {
+async function postResult(result, auth) {
+  const body = JSON.stringify(result);
+  const header = await buildAuthHeader(auth.extensionPairKey, "ext->bridge", "POST", "/result", auth.extensionId, auth.bridgeId, body);
   await fetch(`${BRIDGE_URL}/result`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(result),
+    headers: { "content-type": "application/json", [AUTH_HEADER]: header },
+    body,
   });
 }
 
@@ -748,17 +1017,58 @@ async function dispatch(action, params) {
       const tab = await getTabByParams(params);
       if (params.foreground) await bringToFront(tab);
       if (params.initScript) {
-        // Register a one-shot document_start content script. We register, navigate, wait, then unregister.
+        // Register a one-shot document_start content script. The onCommitted listener clears
+        // the slot the moment it fires. The finally below only fires the safety-net cleanup
+        // when the navigation aborts before commit, so that:
+        //   - aborted navigation: slot cleared so it can't be picked up by a later URL the
+        //     user navigates to in this tab;
+        //   - waitUntilLoad=false success: onCommitted fires asynchronously *after* our
+        //     await wait already resolved; we must NOT clear in finally before it has a
+        //     chance to fire, otherwise the init script never injects.
         await registerInitScript(tab.id, params.initScript);
       }
-      const wait = params.waitUntilLoad !== false ? waitForTabComplete(tab.id, params.timeoutMs || 15000) : Promise.resolve(undefined);
-      const updated = await chrome.tabs.update(tab.id, { url: params.url });
-      try {
-        await wait;
-      } finally {
-        if (params.initScript) await unregisterInitScript(tab.id).catch(() => undefined);
+      // Track onCommitted for *this* tab so we know whether the navigation actually reached
+      // document_start (and thus injected the init script). The global onCommitted listener
+      // clears `initScriptIds` immediately; this local one only flips a flag we use to
+      // decide whether the finally block needs to do safety-net cleanup.
+      let committed = false;
+      let resolveCommitted;
+      const committedPromise = new Promise((r) => { resolveCommitted = r; });
+      let cleanupCommittedListener;
+      if (params.initScript) {
+        const listener = (details) => {
+          if (details.tabId === tab.id && details.frameId === 0) { committed = true; resolveCommitted(); }
+        };
+        chrome.webNavigation.onCommitted.addListener(listener);
+        cleanupCommittedListener = () => chrome.webNavigation.onCommitted.removeListener(listener);
       }
-      return formatTab(await chrome.tabs.get(updated.id));
+      try {
+        const wait = params.waitUntilLoad !== false ? waitForTabComplete(tab.id, params.timeoutMs || 15000) : Promise.resolve(undefined);
+        const updated = await chrome.tabs.update(tab.id, { url: params.url });
+        await wait;
+        // With waitUntilLoad:false, `wait` resolves before onCommitted fires. We still need
+        // the init script to inject, so wait up to a short window for commit before letting
+        // finally decide whether to clear the slot. With waitUntilLoad:true this is almost
+        // always a no-op (commit precedes load complete).
+        if (params.initScript && !committed) {
+          const commitWindowMs = Math.min(params.timeoutMs || 15000, 5000);
+          await Promise.race([
+            committedPromise,
+            new Promise((r) => setTimeout(r, commitWindowMs)),
+          ]);
+        }
+        return formatTab(await chrome.tabs.get(updated.id));
+      } finally {
+        if (params.initScript) {
+          if (!committed) {
+            // Navigation never committed (e.g. tabs.update threw, tab closed, or commit
+            // didn't happen within the window). Clear so the armed init script can't fire
+            // on a later unrelated navigation.
+            await unregisterInitScript(tab.id).catch(() => undefined);
+          }
+          cleanupCommittedListener?.();
+        }
+      }
     }
     case "page.screenshot":
       return takeScreenshot(params);
@@ -956,6 +1266,9 @@ if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
     if (details.frameId !== 0) return;
     const source = initScriptIds.get(details.tabId);
     if (!source) return;
+    // One-shot: clear immediately so any subsequent navigation (redirect, history,
+    // user-initiated) does not re-fire the same init script.
+    initScriptIds.delete(details.tabId);
     chrome.scripting.executeScript({
       target: { tabId: details.tabId, frameIds: [0] },
       world: "MAIN",
@@ -964,6 +1277,139 @@ if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
       args: [source],
     }).catch(() => undefined);
   });
+
+  // Early capture: inject console/network instrumentation at document_start of every top-frame
+  // navigation. Without this, errors fired during initial React render or boot-time fetches
+  // are lost before the lazy `installPiChromeInstrumentation()` path (run by
+  // chrome_snapshot/chrome_evaluate/page.console.list/page.network.list) gets a chance to wrap
+  // the globals. The injected function is self-contained (no closure refs) since
+  // chrome.scripting.executeScript serializes it. It is idempotent via __piChromeWrapped and
+  // updates the same window.__PI_CHROME_STATE__ schema as the post-hoc path, so subsequent
+  // calls to installPiChromeInstrumentation() are no-ops.
+  chrome.webNavigation.onCommitted.addListener((details) => {
+    if (details.frameId !== 0) return;
+    chrome.scripting.executeScript({
+      target: { tabId: details.tabId, frameIds: [0] },
+      world: "MAIN",
+      injectImmediately: true,
+      func: installEarlyCapture,
+    }).catch(() => undefined);
+  });
+}
+
+// Self-contained boot-time instrumentation. Must not close over anything outside its body
+// because chrome.scripting.executeScript({func}) serializes it via toString and rebinds in
+// the target page's MAIN world.
+function installEarlyCapture() {
+  const state = window.__PI_CHROME_STATE__ || {
+    nextElementUid: 1,
+    elements: {},
+    console: [],
+    network: [],
+    nextRequestId: 1,
+    instrumentationInstalled: false,
+  };
+  window.__PI_CHROME_STATE__ = state;
+  if (state.instrumentationInstalled) return;
+  state.instrumentationInstalled = true;
+  const pushConsole = (level, args) => {
+    state.console.push({
+      id: state.console.length + 1,
+      level,
+      timestamp: Date.now(),
+      url: location.href,
+      args: Array.from(args).map((arg) => {
+        try {
+          if (typeof arg === "string") return arg;
+          if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
+          return JSON.parse(JSON.stringify(arg));
+        } catch {
+          return String(arg);
+        }
+      }),
+    });
+    if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
+  };
+  for (const level of ["debug", "log", "info", "warn", "error"]) {
+    const original = console[level];
+    if (typeof original !== "function" || original.__piChromeWrapped) continue;
+    const wrapped = function (...args) {
+      pushConsole(level, args);
+      return original.apply(this, args);
+    };
+    wrapped.__piChromeWrapped = true;
+    console[level] = wrapped;
+  }
+  window.addEventListener("error", (event) => pushConsole("pageerror", [event.message, event.filename + ":" + event.lineno + ":" + event.colno]));
+  window.addEventListener("unhandledrejection", (event) => pushConsole("unhandledrejection", [event.reason]));
+  const trimBody = (text) => typeof text === "string" && text.length > 200000 ? text.slice(0, 200000) + `\n[truncated ${text.length - 200000} chars]` : text;
+  const record = (entry) => {
+    state.network.push(entry);
+    if (state.network.length > 1000) state.network.splice(0, state.network.length - 1000);
+    return entry;
+  };
+  if (window.fetch && !window.fetch.__piChromeWrapped) {
+    const originalFetch = window.fetch.bind(window);
+    const wrappedFetch = async (...args) => {
+      const id = "req-" + state.nextRequestId++;
+      const startedAt = Date.now();
+      const input = args[0];
+      const init = args[1] || {};
+      const url = typeof input === "string" ? input : input?.url;
+      const method = (init.method || input?.method || "GET").toUpperCase();
+      const entry = record({ id, type: "fetch", method, url: String(url || ""), startedAt, pageUrl: location.href, status: "pending" });
+      try {
+        const response = await originalFetch(...args);
+        entry.status = response.status;
+        entry.statusText = response.statusText;
+        entry.ok = response.ok;
+        entry.responseUrl = response.url;
+        entry.durationMs = Date.now() - startedAt;
+        entry.responseHeaders = Array.from(response.headers.entries());
+        response.clone().text().then((text) => {
+          entry.responseBody = trimBody(text);
+          entry.responseBodyTruncated = typeof text === "string" && text.length > 200000;
+        }).catch((error) => { entry.responseBodyError = error?.message || String(error); });
+        return response;
+      } catch (error) {
+        entry.error = error?.message || String(error);
+        entry.durationMs = Date.now() - startedAt;
+        throw error;
+      }
+    };
+    wrappedFetch.__piChromeWrapped = true;
+    window.fetch = wrappedFetch;
+  }
+  if (window.XMLHttpRequest && !XMLHttpRequest.prototype.open.__piChromeWrapped) {
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      this.__piChromeRequest = { method: String(method || "GET").toUpperCase(), url: String(url || "") };
+      return originalOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.open.__piChromeWrapped = true;
+    XMLHttpRequest.prototype.send = function (body) {
+      const id = "req-" + state.nextRequestId++;
+      const startedAt = Date.now();
+      const info = this.__piChromeRequest || {};
+      const entry = record({ id, type: "xhr", method: info.method || "GET", url: info.url || "", startedAt, pageUrl: location.href, status: "pending" });
+      this.addEventListener("loadend", () => {
+        entry.status = this.status;
+        entry.statusText = this.statusText;
+        entry.responseUrl = this.responseURL;
+        entry.durationMs = Date.now() - startedAt;
+        try { entry.responseHeadersText = this.getAllResponseHeaders(); } catch {}
+        try {
+          if (typeof this.responseText === "string") {
+            entry.responseBody = trimBody(this.responseText);
+            entry.responseBodyTruncated = this.responseText.length > 200000;
+          }
+        } catch (error) { entry.responseBodyError = error?.message || String(error); }
+      });
+      this.addEventListener("error", () => { entry.error = "XMLHttpRequest error"; entry.durationMs = Date.now() - startedAt; });
+      return originalSend.call(this, body);
+    };
+  }
 }
 
 async function bringToFront(tab) {
