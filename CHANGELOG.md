@@ -2,6 +2,15 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.29 — 2026-05-31
+
+Strict-CSP support: `chrome_evaluate`, `chrome_snapshot`, `chrome_wait_for`, and `chrome_navigate initScript` now work on pages that block `unsafe-eval`.
+
+- **CDP-based evaluation bypasses page CSP.** `chrome_evaluate`/`chrome_snapshot` (and all snapshot-driven inspection) previously ran user code in the page MAIN world via the **Function constructor**, which is blocked by `script-src 'self'` without `'unsafe-eval'` — so they returned null/empty (or `EvalError`) on github.com and many bank/SaaS apps. They now evaluate through CDP `Runtime.evaluate`, a DevTools protocol command that is not subject to the page's Content-Security-Policy. Rich return values (undefined/function/symbol/bigint/Error markers, DOMRect expansion) and the expression/statement fallback are preserved.
+- **`chrome_wait_for` polls via CDP.** The selector/expression polling loop moved from in-page `new Function()` to service-worker-side CDP evaluation, so waits work under strict CSP too.
+- **`chrome_navigate initScript` injects via CDP.** Document-start init scripts now register with `Page.addScriptToEvaluateOnNewDocument` instead of `new Function()` on `webNavigation.onCommitted`, so seeding localStorage / stubbing `Date.now` works under strict CSP.
+- **Tests.** Added a Node unit harness (`test-suite/unit/csp-eval.test.mjs`, run via `npm test`) validating the evaluate/execute/waitFor refactor, and an in-browser regression challenge (42 `strict-csp-evaluate`) that reads a JS-only secret under strict CSP. Updated challenge 39's notes and docs (FAQ, EXAMPLES, COMPARISON, primer) which previously stated eval/snapshot fail under strict CSP.
+
 ## 0.15.28 — 2026-05-31
 
 Low-risk reliability fixes from a long-session bug report.

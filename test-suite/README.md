@@ -125,7 +125,7 @@ Each unit challenge has a `gate` field:
 - `dom-complexity` / `frames` — Shadow DOM and iframe targeting.
 - `files` — file attachment to `<input type=file>`.
 - `observability` — console/network capture tools.
-- `csp` — strict Content Security Policy fallback where eval/snapshot may fail.
+- `csp` — strict Content Security Policy: screenshot/coordinate fallback (39) and the CDP eval/snapshot bypass that works under `script-src 'self'` without `unsafe-eval` (42).
 - `lazy-loading` — dynamic DOM readiness and wait behavior.
 - `fingerprint` — environment and stack fingerprint probes.
 - `agent-safety` — hidden honeypots and safe target selection.
@@ -175,6 +175,7 @@ The dashboard renders this from `manifest.json`. In brief:
 39. strict CSP screenshot/coordinate fallback
 40. dynamic wait/readiness
 41. explicit tab lifecycle
+42. strict CSP eval/snapshot via CDP (regression guard for the CSP bypass)
 
 ## Design notes
 

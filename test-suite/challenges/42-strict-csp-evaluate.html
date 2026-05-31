@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'">
+<title>42 strict CSP evaluate/snapshot</title>
+<link rel="stylesheet" href="../_style.css">
+<script src="../_lib.js"></script>
+<body>
+<main>
+  <p>Goal: this page ships a strict CSP (<code>script-src 'self'</code>, no <code>unsafe-eval</code>), which blocks <code>eval</code>/<code>new Function</code>. <code>chrome_evaluate</code> and <code>chrome_snapshot</code> must still work because they run through CDP, which is not subject to page CSP.</p>
+  <p id="hint">A secret token is exposed only at <code>window.__cspToken</code> — it is never written into the DOM. Use <code>chrome_evaluate</code> to read it, type it into the field (snapshot/uid to find the field), then click Verify.</p>
+  <label for="tokenInput">Token:</label>
+  <input id="tokenInput" type="text" autocomplete="off" aria-label="csp token">
+  <button id="verify" aria-label="verify token">Verify</button>
+</main>
+<script src="42-strict-csp-evaluate.js"></script>
+</body>

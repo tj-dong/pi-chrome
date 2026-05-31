@@ -1510,7 +1510,7 @@
       "strict-csp"
     ],
     "notes": [
-      "chrome_snapshot/chrome_evaluate may fail on this page because script-src omits unsafe-eval; this is intentional. Use screenshot plus viewport coordinates, then read verdict from dashboard/localStorage after leaving CSP page."
+      "This challenge exercises the pure screenshot + viewport-coordinate path (no snapshot/evaluate needed). Note: as of the CDP CSP bypass, chrome_snapshot/chrome_evaluate DO work here even though script-src omits unsafe-eval (see challenge 42 strict-csp-evaluate). Read verdict from dashboard/localStorage after leaving the CSP page."
     ],
     "manualBaseline": "unverified",
     "gradeSource": "page"
@@ -1623,6 +1623,57 @@
     ],
     "notes": [
       "Recipe contains dynamic tab IDs; runner must substitute ids from chrome_tab list. Complements target=_blank by testing explicit new/close/activate tools."
+    ],
+    "manualBaseline": "unverified",
+    "gradeSource": "page"
+  },
+  {
+    "id": "strict-csp-evaluate",
+    "file": "challenges/42-strict-csp-evaluate.html",
+    "category": "csp",
+    "difficulty": "L2",
+    "gate": "core",
+    "goal": "On a page with strict CSP (script-src 'self', no unsafe-eval), use chrome_evaluate + chrome_snapshot via CDP to read a JS-only secret (window.__cspToken), then submit it with trusted input.",
+    "expected": {
+      "synthetic": "FAIL",
+      "trusted": "PASS",
+      "manual": "PASS"
+    },
+    "recipe": [
+      {
+        "tool": "chrome_evaluate",
+        "params": {
+          "expression": "window.__cspToken"
+        }
+      },
+      {
+        "tool": "chrome_fill",
+        "params": {
+          "selector": "#tokenInput",
+          "value": "$RESULT_OF_chrome_evaluate",
+          "trusted": true
+        }
+      },
+      {
+        "tool": "chrome_click",
+        "params": {
+          "selector": "#verify",
+          "trusted": true
+        }
+      }
+    ],
+    "requires": {
+      "cdp": true
+    },
+    "tags": [
+      "csp",
+      "evaluate",
+      "snapshot",
+      "strict-csp",
+      "cdp-bypass"
+    ],
+    "notes": [
+      "Regression guard for the CDP CSP bypass: chrome_evaluate and chrome_snapshot must work even though script-src omits unsafe-eval (eval/new Function are blocked). The token is non-enumerable and never in the DOM, so it can only be obtained via chrome_evaluate. Runner must substitute the evaluate result into the fill value. synthetic FAIL is due to the trusted-click gate, not eval availability."
     ],
     "manualBaseline": "unverified",
     "gradeSource": "page"

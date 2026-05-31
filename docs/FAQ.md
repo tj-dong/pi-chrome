@@ -55,7 +55,7 @@ pi-chrome controls web pages through Chrome extension APIs, page inspection, scr
 
 ## Does `chrome_evaluate` work on strict-CSP pages?
 
-Not always. `chrome_evaluate` and `chrome_snapshot` run in the page's MAIN world through the Function constructor, so pages whose CSP blocks `'unsafe-eval'` can reject them. `chrome_screenshot`, `chrome_navigate`, tab tools, and real Chrome input still work because they use extension/browser APIs rather than page JavaScript.
+Yes. `chrome_evaluate` and `chrome_snapshot` run in the page's MAIN world through CDP `Runtime.evaluate`, which is a DevTools protocol command and is **not** subject to the page's Content-Security-Policy. They work even on pages that block `'unsafe-eval'` (e.g. github.com and many bank/SaaS apps). `chrome_navigate`'s `initScript` injects at document_start via CDP and likewise bypasses CSP. `chrome_screenshot`, tab tools, and real Chrome input also keep working under any CSP.
 
 ## How do I tell whether a click or type worked?
 

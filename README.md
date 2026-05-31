@@ -217,7 +217,7 @@ Multiple Pi sessions (planner / worker / audit) can all drive the same Chrome at
 
 ## Built-in benchmark suite
 
-[`test-suite/`](./test-suite) is a benchmark for **any** browser-control agent (not just pi-chrome). It includes **41 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks**.
+[`test-suite/`](./test-suite) is a benchmark for **any** browser-control agent (not just pi-chrome). It includes **42 primitive challenges** plus **4 hermetic BrowserGym-style long-horizon tasks**.
 
 Scoring tracks expected outcomes per challenge rather than raw PASS count, so tools are judged against their declared browser-control capability. Unit challenges are split into gate buckets:
 

@@ -161,6 +161,6 @@ Interactive tools use Chrome's real input layer by default: clicks, typing, fill
 - fullscreen and other user-activation checks
 - pages where DOM injection/evaluate is limited, if the agent can use screenshots + coordinates
 
-Strict CSP note: `chrome_snapshot`/`chrome_evaluate` may be blocked on pages that disallow `unsafe-eval`; `chrome_screenshot`, tab/navigation tools, and real input still work.
+Strict CSP note: `chrome_snapshot`/`chrome_evaluate` work even on pages that disallow `unsafe-eval`, because they run via CDP `Runtime.evaluate` (not page-level `eval`/`new Function`), which is not subject to page CSP. `chrome_screenshot`, tab/navigation tools, and real input also work under any CSP.
 
 Chrome may show its debugger banner while pi-chrome is attached.

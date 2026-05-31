@@ -217,6 +217,38 @@ async function cdp(tabId, method, params) {
   }
 }
 
+// cdpEval: evaluate a JavaScript expression string in the page's MAIN world via CDP
+// Runtime.evaluate. Runtime.evaluate is a DevTools protocol command and is NOT subject to
+// the page's Content-Security-Policy, so it works on pages that ship `script-src 'self'`
+// without `'unsafe-eval'` (which blocks `eval`/`new Function`). Ensures the debugger is
+// attached first. Returns the raw CDP result ({ result, exceptionDetails }).
+async function cdpEval(tabId, expression, opts) {
+  await attachDebugger(tabId);
+  return cdp(tabId, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+    userGesture: true,
+    ...(opts || {}),
+  });
+}
+
+function cdpExceptionText(details) {
+  if (!details) return "";
+  return String(
+    details.exception?.description ||
+      details.exception?.value ||
+      details.text ||
+      "",
+  );
+}
+
+function cdpIsSyntaxError(details) {
+  if (!details) return false;
+  const className = String(details.exception?.className || "");
+  return className === "SyntaxError" || /SyntaxError/.test(cdpExceptionText(details));
+}
+
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
 async function resolveTargetInTab(tabId, params) {
   const results = await chrome.scripting.executeScript({
@@ -739,8 +771,29 @@ async function dispatch(action, params) {
       return executeInTab(params, listNetworkRequests, [params.includePreservedRequests === true, params.clear === true]);
     case "page.network.get":
       return executeInTab(params, getNetworkRequest, [params.requestId]);
-    case "page.waitFor":
-      return executeInTab(params, waitForPage, [params.kind, params.value, params.timeoutMs || 10000, params.intervalMs || 250]);
+    case "page.waitFor": {
+      // Poll from the service worker via CDP (bypasses CSP). The old approach ran the polling
+      // loop in-page with new Function() for expression checks, which fails under strict CSP.
+      const tab = await getTabByParams(params);
+      if (params.foreground) await bringToFront(tab);
+      const timeoutMs = params.timeoutMs || 10000;
+      const intervalMs = params.intervalMs || 250;
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        let ok = false;
+        try {
+          const expr = params.kind === "selector"
+            ? `!!document.querySelector(${JSON.stringify(params.value)})`
+            : params.value;
+          ok = Boolean(await evaluateInTab({ ...params, expression: expr, foreground: false }));
+        } catch {
+          ok = false;
+        }
+        if (ok) return { elapsedMs: Date.now() - started };
+        await sleep(intervalMs);
+      }
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${params.kind}: ${params.value}`);
+    }
     case "page.probe":
       // Lightweight capability probe for /chrome-doctor. Runs in MAIN world.
       return executeInTab(params, probePage, []);
@@ -847,25 +900,33 @@ const HELPER_FUNCS = [
 async function executeInTab(params, func, args) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  const helperSource = HELPER_FUNCS.map((helper) => helper.toString()).join("\n");
+
+  // Phase 1: define the helpers and the action function as page globals via CDP
+  // Runtime.evaluate. This bypasses page CSP (no `eval`/`new Function`), which is the
+  // root cause of snapshot/click/etc silently failing on `script-src 'self'` sites.
+  // Each helper is a named function declaration, assigned to window.<name> so the action
+  // (which references helpers by bare name) resolves them as globals at call time.
+  const assignments = HELPER_FUNCS.map((helper) => `window.${helper.name}=${helper.toString()}`).join(";\n");
+  const actionAssign = `window.__piAction=(${func.toString()})`;
+  const defineRes = await cdpEval(tab.id, `(()=>{${assignments};\n${actionAssign};})()`);
+  if (defineRes.exceptionDetails) {
+    throw new Error(`Failed to inject Chrome page helpers: ${cdpExceptionText(defineRes.exceptionDetails) || "unknown error"}`);
+  }
+
+  // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
+  // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
+  // serialize the invocation args. The wrapper references window.__piAction defined above.
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: "MAIN",
-    func: async (helperSource, source, invocationArgs) => {
+    func: async (invocationArgs) => {
       try {
-        // Helpers are plain function declarations; injecting them via Function constructor avoids
-        // running through `eval` (which is restricted under strict CSP) and keeps them isolated.
-        new Function(helperSource).call(globalThis);
-        // The action itself is reconstructed from its source text. We use `new Function` rather
-        // than `eval` because the latter is blocked by `script-src 'self'` (no `'unsafe-eval'`)
-        // CSPs that are common on production sites.
-        const injected = new Function(helperSource + "\nreturn (" + source + ");").call(globalThis);
-        return { ok: true, value: await injected(...invocationArgs) };
+        return { ok: true, value: await window.__piAction(...invocationArgs) };
       } catch (error) {
         return { ok: false, error: error?.stack || error?.message || String(error) };
       }
     },
-    args: [helperSource, func.toString(), args],
+    args: [args || []],
   });
   const first = results?.[0];
   if (first?.error) {
@@ -879,72 +940,54 @@ async function executeInTab(params, func, args) {
   return envelope?.value;
 }
 
-// Dedicated executor for page.evaluate. Doesn't go through the helper-source injection chain;
-// that chain was the root cause of `chrome_evaluate` silently returning null on pages with strict
-// CSP. We build a single Function in MAIN world and invoke it directly.
+// Serializer for page.evaluate results. Embedded (via .toString()) into the CDP-evaluated
+// expression so we can return rich markers for values that don't survive returnByValue
+// (undefined/function/symbol/bigint/Error), plus expand DOMRect-like objects whose fields
+// are non-enumerable. Kept as a standalone function so it stays editable/lintable.
+function piEvalStringify(v) {
+  if (v === undefined) return { kind: "undefined" };
+  if (typeof v === "function") return { kind: "function", source: v.toString().slice(0, 500) };
+  if (typeof v === "symbol") return { kind: "symbol", description: v.description };
+  if (typeof v === "bigint") return { kind: "bigint", value: v.toString() };
+  if (v instanceof Error) return { kind: "error", name: v.name, message: v.message, stack: v.stack };
+  // DOMRect/DOMRectReadOnly (and getBoundingClientRect results) have non-enumerable
+  // properties, so JSON.stringify yields `{}`. Expand the fields explicitly.
+  if ((typeof DOMRectReadOnly !== "undefined" && v instanceof DOMRectReadOnly) ||
+      (typeof DOMRect !== "undefined" && v instanceof DOMRect) ||
+      (v && typeof v === "object" && typeof v.toJSON === "function" &&
+       typeof v.width === "number" && typeof v.height === "number" && typeof v.top === "number")) {
+    return { x: v.x, y: v.y, width: v.width, height: v.height, top: v.top, right: v.right, bottom: v.bottom, left: v.left };
+  }
+  return v;
+}
+
+// Dedicated executor for page.evaluate. Uses CDP Runtime.evaluate (via cdpEval) which is not
+// subject to the page's CSP, fixing `chrome_evaluate` silently returning null / failing on
+// pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
 async function evaluateInTab(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   const expression = String(params.expression ?? "");
-  const awaitPromise = params.awaitPromise !== false;
-  const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "MAIN",
-    func: async (expression, awaitPromise) => {
-      const stringify = (v) => {
-        if (v === undefined) return { kind: "undefined" };
-        if (typeof v === "function") return { kind: "function", source: v.toString().slice(0, 500) };
-        if (typeof v === "symbol") return { kind: "symbol", description: v.description };
-        if (typeof v === "bigint") return { kind: "bigint", value: v.toString() };
-        if (v instanceof Error) return { kind: "error", name: v.name, message: v.message, stack: v.stack };
-        // DOMRect/DOMRectReadOnly (and getBoundingClientRect results) have non-enumerable
-        // properties, so JSON.stringify yields `{}`. Expand the fields explicitly.
-        if ((typeof DOMRectReadOnly !== "undefined" && v instanceof DOMRectReadOnly) ||
-            (typeof DOMRect !== "undefined" && v instanceof DOMRect) ||
-            (v && typeof v === "object" && typeof v.toJSON === "function" &&
-             typeof v.width === "number" && typeof v.height === "number" && typeof v.top === "number")) {
-          return { x: v.x, y: v.y, width: v.width, height: v.height, top: v.top, right: v.right, bottom: v.bottom, left: v.left };
-        }
-        return v;
-      };
-      // Compile via the Function constructor. We try expression form first so callers can pass
-      // `1+1` or `document.title` without a `return`; if that's a SyntaxError we retry with the
-      // statement form so callers can use multi-statement bodies (loops, var decls, etc).
-      const compile = (src) => {
-        try {
-          return { fn: new Function(`return (async () => (${src}))();`), mode: "expression" };
-        } catch (e1) {
-          if (e1 && e1.name === "SyntaxError") {
-            try {
-              return { fn: new Function(`return (async () => { ${src} })();`), mode: "statement" };
-            } catch (e2) {
-              throw e2;
-            }
-          }
-          throw e1;
-        }
-      };
-      try {
-        const { fn } = compile(expression);
-        const value = await fn.call(globalThis);
-        const resolved = awaitPromise && value && typeof value.then === "function" ? await value : value;
-        return { ok: true, value: stringify(resolved) };
-      } catch (error) {
-        return { ok: false, error: error?.stack || error?.message || String(error) };
-      }
-    },
-    args: [expression, awaitPromise],
-  });
-  const first = results?.[0];
-  if (first?.error) {
-    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
-    throw new Error(`chrome_evaluate failed: ${message}`);
+  const stringifySrc = `(${piEvalStringify.toString()})`;
+  // Wrap the user expression so the result is run through piEvalStringify in-page before it
+  // crosses the returnByValue boundary. Try expression form first (so `1+1` / `document.title`
+  // work without `return`); on a SyntaxError fall back to statement form for multi-statement
+  // bodies (loops, var decls, etc), matching the previous new Function() two-form behavior.
+  const buildWrapper = (form) => `(async () => { const __s=${stringifySrc}; const __v = await ${form}; return __s(__v); })()`;
+  const exprForm = `(async () => (${expression}))()`;
+  const stmtForm = `(async () => { ${expression} })()`;
+
+  let res = await cdpEval(tab.id, buildWrapper(exprForm));
+  if (res.exceptionDetails && cdpIsSyntaxError(res.exceptionDetails)) {
+    res = await cdpEval(tab.id, buildWrapper(stmtForm));
   }
-  const envelope = first?.result;
-  if (!envelope) throw new Error("chrome_evaluate returned no envelope from MAIN world");
-  if (envelope.ok === false) throw new Error(envelope.error || "chrome_evaluate failed");
-  const v = envelope.value;
-  // Unwrap special markers from MAIN world
+  if (res.exceptionDetails) {
+    throw new Error(`chrome_evaluate failed: ${cdpExceptionText(res.exceptionDetails) || "evaluation failed"}`);
+  }
+  const result = res.result;
+  if (!result || result.type === "undefined") return undefined;
+  const v = result.value;
+  // Unwrap special markers produced by piEvalStringify.
   if (v && typeof v === "object" && !Array.isArray(v)) {
     if (v.kind === "undefined") return undefined;
     if (v.kind === "function") return `[Function: ${v.source}]`;
@@ -964,29 +1007,23 @@ async function withOptionalSnapshot(params, actionFn) {
   return result;
 }
 
-// One-shot init script registry, scoped per tab. The script source is injected at
-// document_start of the next committed navigation in that tab, in MAIN world, then cleared.
-const initScriptIds = new Map();
+// One-shot init script registry, scoped per tab. The source is registered with CDP
+// Page.addScriptToEvaluateOnNewDocument, which runs it at document_start in the page's MAIN
+// world and is NOT subject to page CSP (the old func:(code)=>new Function(code) path was
+// blocked by `script-src 'self'`). page.navigate registers before the nav and unregisters
+// after load, so only the intended navigation receives the script.
+const initScriptIds = new Map(); // tabId -> CDP script identifier
 async function registerInitScript(tabId, source) {
-  initScriptIds.set(tabId, source);
+  await attachDebugger(tabId);
+  await cdp(tabId, "Page.enable", {}).catch(() => undefined);
+  const result = await cdp(tabId, "Page.addScriptToEvaluateOnNewDocument", { source });
+  if (result && result.identifier !== undefined) initScriptIds.set(tabId, result.identifier);
 }
 async function unregisterInitScript(tabId) {
+  const identifier = initScriptIds.get(tabId);
+  if (identifier === undefined) return;
   initScriptIds.delete(tabId);
-}
-
-if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
-  chrome.webNavigation.onCommitted.addListener((details) => {
-    if (details.frameId !== 0) return;
-    const source = initScriptIds.get(details.tabId);
-    if (!source) return;
-    chrome.scripting.executeScript({
-      target: { tabId: details.tabId, frameIds: [0] },
-      world: "MAIN",
-      injectImmediately: true,
-      func: (code) => { try { new Function(code).call(globalThis); } catch (e) { console.error("[pi-chrome init script]", e); } },
-      args: [source],
-    }).catch(() => undefined);
-  });
+  await cdp(tabId, "Page.removeScriptToEvaluateOnNewDocument", { identifier }).catch(() => undefined);
 }
 
 // Always inject early console/network capture at document_start on every navigation.
@@ -2074,20 +2111,6 @@ function getNetworkRequest(requestId) {
   const request = getPiChromeState().network.find((entry) => entry.id === requestId);
   if (!request) throw new Error(`No network request with id ${requestId}`);
   return request;
-}
-
-async function waitForPage(kind, value, timeoutMs, intervalMs) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    let ok = false;
-    if (kind === "selector") ok = Boolean(document.querySelector(value));
-    else {
-      try { ok = Boolean(new Function("return (" + value + ");").call(globalThis)); } catch { ok = false; }
-    }
-    if (ok) return { elapsedMs: Date.now() - started };
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${kind}: ${value}`);
 }
 
 function normalizeKey(key) {

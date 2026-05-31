@@ -665,7 +665,7 @@ Chrome control is available through the chrome_* tools via a companion Chrome ex
 Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
-- \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via the **Function constructor**, which requires \`'unsafe-eval'\` in the page CSP. Pages with strict CSP (e.g. github.com, many bank/SaaS apps) will throw \`EvalError: ... 'unsafe-eval' is not an allowed source of script\` and chrome_snapshot will return empty. On those pages, drive the page with \`chrome_screenshot\` + viewport-coordinate \`chrome_click\`/\`chrome_type\`/\`chrome_key\`. \`chrome_navigate\`, \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input all keep working under any CSP.
+- \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
