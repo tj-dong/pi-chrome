@@ -176,15 +176,15 @@ This protects your signed-in Chrome profile from accidental agent use. The loopb
 
 ### Run in background / watch modes
 
-By default, every `chrome_*` call focuses Chrome and activates the target tab so you can **watch the agent work** — invaluable for demos, debugging, and first-time confidence.
+By default, every `chrome_*` call runs in the **background** — Chrome won't pop up or steal focus. Switch to foreground when you want to **watch the agent work** (demos, debugging, first-time confidence).
 
 ```text
 /chrome background          # toggle for the whole session
-/chrome background on       # run in background
+/chrome background on       # run in background (default)
 /chrome background off      # bring Chrome forward so you can watch
 ```
 
-Per-call `background: true` wins over the session setting.
+Per-call `background: false` wins over the session setting (and `background: true` forces background).
 
 ### Diagnostics
 

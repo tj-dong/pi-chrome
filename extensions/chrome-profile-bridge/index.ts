@@ -549,7 +549,7 @@ export default function (pi: ExtensionAPI): void {
 	globalState[PI_CHROME_GLOBAL_KEY] = { version: PI_CHROME_VERSION, root: currentRoot, token: instanceToken };
 
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
-	let backgroundDefault = false;
+	let backgroundDefault = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	let chromeToolsRegistered = false;
 	let authExpiryTimer: NodeJS.Timeout | undefined;
@@ -635,7 +635,7 @@ export default function (pi: ExtensionAPI): void {
 		return bridge.send(action, params, timeoutMs, signal);
 	};
 
-	// Translate the public `background` parameter (default false = visible/foreground) into the
+	// Translate the public `background` parameter (default on = silent/background) into the
 	// service worker's wire-level `foreground` flag, accepting legacy `foreground` as a fallback.
 	const withBackground = <T extends Record<string, unknown>>(params: T): T => {
 		const typed = params as { background?: boolean; foreground?: boolean };
@@ -682,7 +682,7 @@ Usage rules:
 3. \`includeSnapshot=true\` on click/type/fill/key to verify in one round trip.
 4. If \`chrome_evaluate\` returns null when you expected a value, the expression evaluated to null/undefined in the page; surface the value via \`JSON.stringify\` to confirm.
 5. \`chrome_navigate\` supports an optional \`initScript\` that runs at document_start in MAIN world for the next navigation (good for seeding localStorage or stubbing Date.now).
-6. By default chrome_* tools focus Chrome so the user can watch; pass \`background=true\` or run /chrome background on for session-wide background execution.
+6. By default chrome_* tools run in the background without focusing Chrome; pass \`background=false\` or run /chrome background off when the user wants to watch Chrome work.
 7. If you hit a native file-picker or privileged browser prompt gate, tell the user; generic clicks/typing/CSP gates are handled by Chrome input.
 8. Run /chrome doctor when in doubt about connectivity or capabilities.
 </chrome-profile-bridge>`;
@@ -953,8 +953,8 @@ Usage rules:
 				];
 			} else if (path[0] === "background" && path.length === 1) {
 				candidates = [
-					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus." },
-					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch (default)." },
+					{ fullValue: "background on", label: "on", description: "Run in background. Chrome stays in the background. Your editor keeps focus. (default)" },
+					{ fullValue: "background off", label: "off", description: "Bring Chrome to the front so you can watch." },
 					{ fullValue: "background toggle", label: "toggle", description: "Flip whichever way it's currently set." },
 					{ fullValue: "background status", label: "status", description: "Show the current setting." },
 				];
@@ -1073,7 +1073,7 @@ Usage rules:
 		name: "chrome_snapshot",
 		label: "Chrome Snapshot",
 		description:
-			"Inspect a page in the user's existing Chrome profile: title, URL, visible body text, viewport, and clickable/focusable elements with stable uids plus CSS selectors. Brings Chrome to the foreground by default so the user can watch; pass background=true to inspect silently.",
+			"Inspect a page in the user's existing Chrome profile: title, URL, visible body text, viewport, and clickable/focusable elements with stable uids plus CSS selectors. Runs in the background by default; pass background=false to bring Chrome to the foreground so the user can watch.",
 		promptSnippet: "Inspect the current Chrome page and get CSS selectors for browser automation.",
 		parameters: Type.Object({
 			targetId: Type.Optional(Type.String()),
@@ -1084,7 +1084,7 @@ Usage rules:
 			roleFilter: Type.Optional(Type.String({ description: "Only return elements matching this ARIA role or tag name (case-insensitive). e.g. 'button', 'link', 'textbox'." })),
 			nearUid: Type.Optional(Type.String({ description: "Sort elements by proximity to this snapshot uid. Useful for finding controls near a known anchor." })),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, run silently in the background without focusing Chrome. Default false (Chrome focuses + tab activates so the user can watch)." }),
+				Type.Boolean({ description: "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1104,7 +1104,7 @@ Usage rules:
 		name: "chrome_navigate",
 		label: "Chrome Navigate",
 		description:
-			"Navigate an existing Chrome tab to a URL via the companion extension. By default focuses Chrome and activates the tab so the user can watch; pass background=true to navigate silently. Optionally waits for load completion.",
+			"Navigate an existing Chrome tab to a URL via the companion extension. Runs in the background by default; pass background=false to focus Chrome and activate the tab so the user can watch. Optionally waits for load completion.",
 		promptSnippet: "Navigate a Chrome tab in the user's existing profile.",
 		parameters: Type.Object({
 			url: Type.String(),
@@ -1115,7 +1115,7 @@ Usage rules:
 			timeoutMs: Type.Optional(Type.Number({ default: 15_000 })),
 			initScript: Type.Optional(Type.String({ description: "Optional JavaScript source to run in MAIN world at document_start of the next navigation. Useful for seeding localStorage, stubbing Date.now(), or defining navigator.webdriver=undefined. Requires the companion extension's webNavigation permission." })),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, navigate silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, navigate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1130,7 +1130,7 @@ Usage rules:
 		name: "chrome_evaluate",
 		label: "Chrome Evaluate",
 		description:
-			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. By default focuses Chrome and activates the tab; pass background=true to evaluate silently.",
+			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
 		promptSnippet: "Evaluate JavaScript in the active Chrome tab through the companion extension.",
 		parameters: Type.Object({
 			expression: Type.String(),
@@ -1139,7 +1139,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, evaluate silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, evaluate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1172,7 +1172,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, click silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, click silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1204,7 +1204,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, type silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, type silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1236,7 +1236,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, fill silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, fill silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1255,7 +1255,7 @@ Usage rules:
 		name: "chrome_key",
 		label: "Chrome Key",
 		description:
-			"Send a keyboard key to an existing Chrome tab (Enter, Escape, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, or one character). By default focuses Chrome and activates the tab so the user can watch; pass background=true to send the key silently. Pass includeSnapshot=true to verify after the keypress.",
+			"Send a keyboard key to an existing Chrome tab (Enter, Escape, Tab, Backspace, Delete, ArrowUp/Down/Left/Right, or one character). Runs in the background by default; pass background=false to focus Chrome and activate the tab so the user can watch. Pass includeSnapshot=true to verify after the keypress.",
 		promptSnippet: "Press keys in Chrome through the companion extension.",
 		parameters: Type.Object({
 			key: Type.String(),
@@ -1271,7 +1271,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, send the key silently without focusing Chrome. Default false." }),
+				Type.Boolean({ description: "If true, send the key silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1318,7 +1318,7 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Default false." })),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
@@ -1340,7 +1340,7 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Default false." })),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
@@ -1360,7 +1360,7 @@ Usage rules:
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
-			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Default false." })),
+			background: Type.Optional(Type.Boolean({ description: "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
@@ -1374,7 +1374,7 @@ Usage rules:
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. By default Chrome is focused and the tab activates so the user can watch; pass background=true to capture silently (the tab is briefly activated within its window for the capture, then the previous active tab is restored).",
+			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
@@ -1385,7 +1385,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
 			background: Type.Optional(
-				Type.Boolean({ description: "If true, capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored). Default false." }),
+				Type.Boolean({ description: "If true (the default), capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored); pass false to focus Chrome." }),
 			),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
