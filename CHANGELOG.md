@@ -2,6 +2,17 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.28 — 2026-05-31
+
+Low-risk reliability fixes from a long-session bug report.
+
+- **Bridge self-heals when the owning session dies.** A Pi session running in shared-client mode used to fail every `chrome_*` call with a bare `fetch failed` once the session that owned `127.0.0.1:17318` exited. The client now detects the unreachable owner, takes over the bridge port, and re-runs the command locally instead of staying stuck.
+- **Actionable timeout messages.** A 30s timeout now says *why*: extension not polling (not installed/closed), polling but didn't pick up the command, or picked it up but never returned a result (long-running action / failed result post) — instead of one generic message.
+- **`chrome_type` / `chrome_fill` DOM path no longer throws `pressKeyInPage is not defined`.** The helper is now included in the injected MAIN-world helper set and its callers await it.
+- **`getBoundingClientRect()` / DOMRect now serialize in `chrome_evaluate`.** DOMRect-like values return `{x,y,width,height,top,right,bottom,left}` instead of `{}`.
+- **Clearer stale-target errors.** A missing `targetId` now lists the current tabs and suggests re-targeting via `chrome_tab list` or `urlIncludes`/`titleIncludes`, instead of a bare "No matching Chrome tab found".
+- **`pageMutated=false` no longer reads as failure.** Click/type/fill summaries explain it's a coarse heuristic that can miss real effects, and suggest verifying with `includeSnapshot`.
+
 ## 0.15.26 — 2026-05-16
 
 - **Documentation accuracy.** README, FAQ, examples, comparison, and test-suite docs now describe the 41-challenge suite, gate buckets, strict-CSP fallback, and current human-vs-extension limitations.

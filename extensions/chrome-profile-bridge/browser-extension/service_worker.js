@@ -787,6 +787,20 @@ async function getTabByParams(params) {
   if (params.targetId !== undefined) {
     const id = Number(params.targetId);
     tab = tabs.find((candidate) => candidate.id === id);
+    if (!tab?.id) {
+      // Chrome tab ids are not stable across reloads/navigations; a long session can hold a
+      // stale id. Surface the current tabs so the caller can re-target instead of guessing.
+      const listed = tabs
+        .filter((candidate) => candidate.id !== undefined)
+        .slice(0, 20)
+        .map((candidate) => `  ${candidate.id}${candidate.active ? " *" : ""}\t${(candidate.title || "(untitled)").slice(0, 60)}\t${candidate.url || ""}`)
+        .join("\n");
+      throw new Error(
+        `No Chrome tab with id ${id} (it was likely closed or replaced). ` +
+        `Re-target with chrome_tab list, or pass urlIncludes/titleIncludes instead of targetId.\n` +
+        `Current tabs:\n${listed || "  (none)"}`,
+      );
+    }
   } else if (params.urlIncludes) {
     tab = tabs.find((candidate) => (candidate.url || "").includes(params.urlIncludes));
   } else if (params.titleIncludes) {
@@ -826,6 +840,7 @@ const HELPER_FUNCS = [
   printableKeyCode,
   dispatchKeyEvent,
   typeCharacter,
+  pressKeyInPage,
   scrollPage,
 ];
 
@@ -882,6 +897,14 @@ async function evaluateInTab(params) {
         if (typeof v === "symbol") return { kind: "symbol", description: v.description };
         if (typeof v === "bigint") return { kind: "bigint", value: v.toString() };
         if (v instanceof Error) return { kind: "error", name: v.name, message: v.message, stack: v.stack };
+        // DOMRect/DOMRectReadOnly (and getBoundingClientRect results) have non-enumerable
+        // properties, so JSON.stringify yields `{}`. Expand the fields explicitly.
+        if ((typeof DOMRectReadOnly !== "undefined" && v instanceof DOMRectReadOnly) ||
+            (typeof DOMRect !== "undefined" && v instanceof DOMRect) ||
+            (v && typeof v === "object" && typeof v.toJSON === "function" &&
+             typeof v.width === "number" && typeof v.height === "number" && typeof v.top === "number")) {
+          return { x: v.x, y: v.y, width: v.width, height: v.height, top: v.top, right: v.right, bottom: v.bottom, left: v.left };
+        }
         return v;
       };
       // Compile via the Function constructor. We try expression form first so callers can pass
@@ -1927,7 +1950,7 @@ async function typeIntoPage(selector, uid, text, pressEnter) {
   element.focus();
   if (!(element.isContentEditable || "value" in element)) throw new Error("Focused element is not text-editable");
   for (const ch of Array.from(text)) await typeCharacter(element, ch);
-  if (pressEnter) pressKeyInPage("Enter");
+  if (pressEnter) await pressKeyInPage("Enter");
   const finalValue = "value" in element ? element.value : element.textContent;
   const valueMatches = "value" in element ? element.value.includes(text) : (element.textContent || "").includes(text);
   const pageMutated = pageHash() !== before;
@@ -1947,7 +1970,7 @@ async function typeIntoPage(selector, uid, text, pressEnter) {
   };
 }
 
-function fillPage(selector, uid, text, submit) {
+async function fillPage(selector, uid, text, submit) {
   installPiChromeInstrumentation();
   const before = pageHash();
   let element = elementBySelectorOrUid(selector, uid) || document.activeElement;
@@ -1964,7 +1987,7 @@ function fillPage(selector, uid, text, submit) {
   } else {
     throw new Error("Focused element is not text-editable");
   }
-  if (submit) pressKeyInPage("Enter");
+  if (submit) await pressKeyInPage("Enter");
   return {
     selector, uid, length: String(text).length, submit,
     input: "dom",

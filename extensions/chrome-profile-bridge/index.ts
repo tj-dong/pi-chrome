@@ -35,6 +35,7 @@ type PendingCommand = {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
+	deliveredAt?: number;
 };
 
 type BridgeResult = {
@@ -103,7 +104,11 @@ function summarizeActionResult(result: unknown): string | undefined {
 	if (!result || typeof result !== "object") return undefined;
 	const r = result as Record<string, unknown>;
 	const parts: string[] = [];
-	if (r.pageMutated === false) parts.push("pageMutated=false");
+	// NOTE: pageMutated is a coarse heuristic (a hash over body text + input values + node count).
+	// Many real effects — class/aria/data-state toggles, JS-held state, canvas, async updates —
+	// don't move it, so a false value is NOT proof the action did nothing. Surface it only as a
+	// soft hint, and never present it as a failure on its own.
+	if (r.pageMutated === false) parts.push("no coarse DOM change detected (may still have taken effect — verify with includeSnapshot)");
 	if (r.defaultPrevented === true) parts.push("defaultPrevented=true");
 	if (r.elementVisible === false) parts.push("element NOT visible");
 	if (r.occludedBy) {
@@ -195,28 +200,44 @@ class ChromeProfileBridge {
 
 	async start(): Promise<void> {
 		if (this.server || this.mode === "client") return;
-		this.server = createServer((request, response) => {
+		await this.bindServerOrClient();
+	}
+
+	// Try to own the bridge port. On success we are the server; on EADDRINUSE another Pi
+	// session owns it and we run as a client that forwards commands to that owner.
+	private async bindServerOrClient(): Promise<void> {
+		const server = createServer((request, response) => {
 			void this.handle(request, response).catch((error) => {
 				sendJson(response, 500, { error: (error as Error).message });
 			});
 		});
 		try {
 			await new Promise<void>((resolveStart, rejectStart) => {
-				this.server!.once("error", rejectStart);
-				this.server!.listen(this.port, this.host, () => {
-					this.server!.off("error", rejectStart);
+				server.once("error", rejectStart);
+				server.listen(this.port, this.host, () => {
+					server.off("error", rejectStart);
 					resolveStart();
 				});
 			});
+			this.server = server;
 			this.mode = "server";
 		} catch (error) {
-			this.server.close();
-			this.server = undefined;
+			server.close();
 			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
 			// Another Pi session already owns the bridge port. Use it as the shared
 			// machine-local broker so multiple Pi sessions can control Chrome at once.
 			this.mode = "client";
 		}
+	}
+
+	// Client-mode self-heal: when the owning Pi session disappears, fetches to its port fail
+	// with `fetch failed` / ECONNREFUSED forever. Try to grab the now-free port and become the
+	// server ourselves so chrome_* tools recover without a manual restart.
+	private async tryPromoteToServer(): Promise<boolean> {
+		if (this.mode !== "client") return this.mode === "server";
+		this.mode = undefined;
+		await this.bindServerOrClient();
+		return this.mode === "server";
 	}
 
 	stop(): void {
@@ -261,14 +282,11 @@ class ChromeProfileBridge {
 				rejectCommand(new Error("Chrome command aborted"));
 			};
 			const timer = setTimeout(() => {
+				const entry = this.pending.get(id);
 				this.pending.delete(id);
 				this.queue = this.queue.filter((queued) => queued.id !== id);
 				cleanupAbort();
-				rejectCommand(
-					new Error(
-						`Timed out waiting for Chrome extension after ${timeoutMs}ms. Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile.`,
-					),
-				);
+				rejectCommand(new Error(this.timeoutMessage(entry, timeoutMs)));
 			}, timeoutMs);
 			this.pending.set(id, {
 				command,
@@ -279,6 +297,21 @@ class ChromeProfileBridge {
 			if (signal) signal.addEventListener("abort", onAbort, { once: true });
 			this.enqueue(command);
 		});
+	}
+
+	// Classify why a local command timed out so the agent isn't left guessing. The three
+	// distinct failure modes are: extension never polled (not installed / not running),
+	// extension polled but never picked up this command, and extension picked up the command
+	// but never posted a result back (long-running action or a failed /result post).
+	private timeoutMessage(entry: PendingCommand | undefined, timeoutMs: number): string {
+		const pollAgeMs = this.lastSeenAt === undefined ? undefined : Date.now() - this.lastSeenAt;
+		if (entry?.deliveredAt) {
+			return `Timed out after ${timeoutMs}ms: the Chrome extension received the command but never returned a result. The action may be long-running, or the result post failed. Run /chrome doctor; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
+		}
+		if (pollAgeMs === undefined || pollAgeMs > 60_000) {
+			return `Timed out after ${timeoutMs}ms: the Chrome extension is not polling (last seen ${pollAgeMs === undefined ? "never" : Math.round(pollAgeMs / 1000) + "s ago"}). Run /chrome onboard, then load the bundled browser-extension folder in your normal Chrome profile and keep that Chrome window open.`;
+		}
+		return `Timed out after ${timeoutMs}ms: the Chrome extension is polling (last seen ${Math.round(pollAgeMs / 1000)}s ago) but did not pick up this command in time. Retry; if it persists, reload 'Pi Chrome Connector' at chrome://extensions.`;
 	}
 
 	private async sendViaOwner(action: string, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
@@ -309,11 +342,34 @@ class ChromeProfileBridge {
 				if (signal?.aborted) throw new Error("Chrome command aborted");
 				throw new Error(`Timed out waiting for shared Chrome bridge owner after ${timeoutMs}ms`);
 			}
+			// `fetch failed` / ECONNREFUSED means the Pi session that owned the bridge port is gone.
+			// Try to take over the port ourselves and re-run the command locally instead of staying
+			// stuck as a client pointed at a dead owner.
+			if (this.isOwnerUnreachable(error)) {
+				const promoted = await this.tryPromoteToServer().catch(() => false);
+				if (promoted) return this.sendLocal(action, params, timeoutMs, signal);
+				throw new Error(
+					"The Pi session that owned the Chrome bridge is unreachable and this session could not take over the bridge port. Restart this Pi session, or run /chrome doctor.",
+				);
+			}
 			throw error;
 		} finally {
 			clearTimeout(timer);
 			if (signal) signal.removeEventListener("abort", forwardAbort);
 		}
+	}
+
+	private isOwnerUnreachable(error: unknown): boolean {
+		const message = (error as Error)?.message ?? "";
+		const code = (error as NodeJS.ErrnoException)?.code ?? "";
+		const cause = (error as { cause?: NodeJS.ErrnoException })?.cause;
+		const causeCode = cause?.code ?? "";
+		return (
+			/fetch failed|ECONNREFUSED|ECONNRESET|other side closed|socket hang up/i.test(message) ||
+			code === "ECONNREFUSED" ||
+			causeCode === "ECONNREFUSED" ||
+			causeCode === "ECONNRESET"
+		);
 	}
 
 	private enqueue(command: BridgeCommand): void {
@@ -383,6 +439,12 @@ class ChromeProfileBridge {
 				// so the next live /next picks it up instead of dropping it on the floor.
 				if (command) this.queue.unshift(command);
 				return;
+			}
+			// Mark the command as delivered so a later timeout can distinguish "extension never
+			// picked it up" from "extension is running it / failed to post a result".
+			if (command) {
+				const entry = this.pending.get(command.id);
+				if (entry) entry.deliveredAt = Date.now();
 			}
 			// Re-read version on every /next so bumping package.json takes effect without pi restart.
 			const currentVersion = readPiChromeVersion();
