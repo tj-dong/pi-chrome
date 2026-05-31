@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.32 — 2026-05-31
+
+- **Session tab-group naming tweak.** Per-session groups are now titled `Pi Session: <name-or-id>` (added a colon separator).
+
 ## 0.15.31 — 2026-05-31
 
 Per-session tab groups.

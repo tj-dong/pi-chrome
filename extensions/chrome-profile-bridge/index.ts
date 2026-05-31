@@ -604,7 +604,7 @@ export default function (pi: ExtensionAPI): void {
 		const sm = ctx.sessionManager;
 		const name = sm.getSessionName?.();
 		const id = sm.getSessionId?.();
-		return `Pi Session ${name || id || "unknown"}`;
+		return `Pi Session: ${name || id || "unknown"}`;
 	};
 
 	const updateChromeStatus = (ctx: ExtensionContext): void => {
@@ -1046,7 +1046,7 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String({ description: "Match the target tab by URL substring for activate/close/group/ungroup." })),
 			titleIncludes: Type.Optional(Type.String({ description: "Match the target tab by title substring for activate/close/group/ungroup." })),
 			group: Type.Optional(Type.Boolean({ description: "action=new only: pass false to open an ungrouped tab. By default every Pi-opened tab joins this session's own tab group." })),
-			groupTitle: Type.Optional(Type.String({ description: "Tab group title for action=group/new. Defaults to this Pi session's group ('Pi Session <name-or-id>'). Pass an empty string on action=new to opt out of grouping." })),
+			groupTitle: Type.Optional(Type.String({ description: "Tab group title for action=group/new. Defaults to this Pi session's group ('Pi Session: <name-or-id>'). Pass an empty string on action=new to opt out of grouping." })),
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
