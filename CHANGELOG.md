@@ -2,6 +2,12 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.31 — 2026-05-31
+
+Per-session tab groups.
+
+- **Each Pi session gets its own tab group.** Auto-grouped tabs are now named `Pi Session <name>` using the session's display name, falling back to the session id when unnamed. Multiple Pi sessions driving the same Chrome no longer share one group — each collects its tabs separately. Pass an explicit `groupTitle` to override, or `group:false` / `groupTitle:""` on `action=new` to opt out.
+
 ## 0.15.30 — 2026-05-31
 
 Tab grouping for `chrome_tab`.
