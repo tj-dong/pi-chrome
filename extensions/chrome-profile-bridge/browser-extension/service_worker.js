@@ -1,6 +1,9 @@
 const BRIDGE_URL = "http://127.0.0.1:17318";
 const CLIENT_NAME = `Pi Chrome Connector ${chrome.runtime.id}`;
 const POLL_ERROR_BACKOFF_MS = 2000;
+const DEFAULT_GROUP_COLOR = "blue";
+const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
+const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 let polling = false;
 
 // =================== Chrome input (CDP) layer ===================
@@ -709,6 +712,58 @@ function isVersionOlder(a, b) {
   return false;
 }
 
+function cleanGroupTitle(value) {
+  const text = String(value || "Pi").replace(/\s+/g, " ").trim().slice(0, 80);
+  return text || "Pi";
+}
+
+function cleanGroupColor(value) {
+  const color = String(value || DEFAULT_GROUP_COLOR).toLowerCase();
+  return VALID_GROUP_COLORS.has(color) ? color : DEFAULT_GROUP_COLOR;
+}
+
+async function groupRecord(groupId) {
+  if (typeof groupId !== "number" || groupId < 0 || !chrome.tabGroups) return null;
+  const group = await chrome.tabGroups.get(groupId).catch(() => null);
+  if (!group) return null;
+  return {
+    id: group.id,
+    title: group.title || "",
+    color: group.color || "",
+    collapsed: Boolean(group.collapsed),
+    windowId: group.windowId,
+    piGroup: Boolean(group.title && PI_GROUP_RE.test(group.title)),
+  };
+}
+
+// Find an existing tab group in `windowId` whose title matches `title` (case-insensitive).
+// Used so all Pi-opened tabs collect into one group per window instead of spawning new ones.
+async function findGroupByTitle(windowId, title) {
+  if (!chrome.tabGroups) return null;
+  const wanted = cleanGroupTitle(title).toLowerCase();
+  const groups = await chrome.tabGroups.query({ windowId }).catch(() => []);
+  const match = groups.find((g) => (g.title || "").trim().toLowerCase() === wanted);
+  return match ? match.id : null;
+}
+
+// Add `tab` to a tab group, then set title/color. If the tab is ungrouped, reuse an
+// existing same-title group in its window when present, otherwise create a new group.
+async function groupTab(tab, title, color) {
+  if (!chrome.tabGroups) throw new Error("chrome.tabGroups API unavailable; reload the extension after granting the tabGroups permission");
+  if (!tab || typeof tab.id !== "number") throw new Error("No tab to group");
+  const groupTitle = cleanGroupTitle(title);
+  let groupId = tab.groupId;
+  if (typeof groupId !== "number" || groupId < 0) {
+    const existing = await findGroupByTitle(tab.windowId, groupTitle);
+    groupId = existing !== null
+      ? await chrome.tabs.group({ groupId: existing, tabIds: [tab.id] })
+      : await chrome.tabs.group({ tabIds: [tab.id] });
+  }
+  await chrome.tabGroups.update(groupId, { title: groupTitle, color: cleanGroupColor(color), collapsed: false });
+  const grouped = await chrome.tabs.get(tab.id);
+  return { tab: await formatTab(grouped), group: await groupRecord(groupId) };
+}
+
 async function dispatch(action, params) {
   switch (action) {
     case "tab.version":
@@ -718,16 +773,30 @@ async function dispatch(action, params) {
         bridgeUrl: BRIDGE_URL,
         userAgent: navigator.userAgent,
       };
-    case "tab.list":
-      return (await chrome.tabs.query({})).map(formatTab);
+    case "tab.list": {
+      const tabs = await chrome.tabs.query({});
+      return Promise.all(tabs.map(formatTab));
+    }
     case "tab.new": {
       const tab = await chrome.tabs.create({ url: params.url || "about:blank", active: true });
-      return formatTab(tab);
+      // Every Pi-opened tab joins a group by default. Pass groupTitle:"" (or group:false) to opt out.
+      const optOut = params.groupTitle === "" || params.group === false;
+      if (optOut && !params.groupColor) return formatTab(tab);
+      return groupTab(tab, params.groupTitle || "Pi", params.groupColor);
     }
     case "tab.activate": {
       const tab = await getTabByParams(params);
       await chrome.windows.update(tab.windowId, { focused: true });
       return formatTab(await chrome.tabs.update(tab.id, { active: true }));
+    }
+    case "tab.group": {
+      const tab = await getTabByParams(params);
+      return groupTab(tab, params.groupTitle || "Pi", params.groupColor);
+    }
+    case "tab.ungroup": {
+      const tab = await getTabByParams(params);
+      if (typeof tab.groupId === "number" && tab.groupId >= 0) await chrome.tabs.ungroup(tab.id);
+      return formatTab(await chrome.tabs.get(tab.id));
     }
     case "tab.close": {
       const tab = await getTabByParams(params);
@@ -811,7 +880,7 @@ async function dispatch(action, params) {
       } finally {
         if (params.initScript) await unregisterInitScript(tab.id).catch(() => undefined);
       }
-      return formatTab(await chrome.tabs.get(updated.id));
+      return await formatTab(await chrome.tabs.get(updated.id));
     }
     case "page.screenshot":
       return takeScreenshot(params);
@@ -820,7 +889,7 @@ async function dispatch(action, params) {
   }
 }
 
-function formatTab(tab) {
+async function formatTab(tab) {
   return {
     id: tab.id,
     windowId: tab.windowId,
@@ -831,6 +900,8 @@ function formatTab(tab) {
     status: tab.status,
     pinned: tab.pinned,
     incognito: tab.incognito,
+    groupId: typeof tab.groupId === "number" ? tab.groupId : -1,
+    group: await groupRecord(tab.groupId),
   };
 }
 
@@ -1095,7 +1166,7 @@ async function takeScreenshot(params) {
       await executeInTab({ ...params, foreground: false }, scrollToY, [tiles.originalScrollY]);
       return {
         fullPage: true,
-        tab: formatTab(tab),
+        tab: await formatTab(tab),
         dimensions: { width: tiles.width, height: tiles.height, viewportHeight: tiles.viewportHeight, dpr: tiles.dpr },
         tiles: captured,
       };
@@ -1104,7 +1175,7 @@ async function takeScreenshot(params) {
       format: params.format || "png",
       quality: params.format === "jpeg" ? params.quality : undefined,
     });
-    return { dataUrl, tab: formatTab(tab) };
+    return { dataUrl, tab: await formatTab(tab) };
   } finally {
     if (previousActiveId !== undefined && previousActiveId !== tab.id) {
       await chrome.tabs.update(previousActiveId, { active: true }).catch(() => undefined);

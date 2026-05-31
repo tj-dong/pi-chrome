@@ -2,6 +2,15 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.30 — 2026-05-31
+
+Tab grouping for `chrome_tab`.
+
+- **Pi-opened tabs auto-group.** `action=new` now drops every tab into a shared `Pi` tab group per window by default (created once, then reused), so agent tabs stay visually separated from your own. Opt out per call with `groupTitle:""` or `group:false`.
+- **`chrome_tab` can group/ungroup tabs.** New `action=group` (and `action=ungroup`) plus `groupTitle`/`groupColor` params. Grouping reuses an existing same-title group in the window instead of spawning duplicates. Defaults: title `Pi`, color `blue`; color validated against Chrome's 9 group colors. Target an existing tab with `targetId`/`urlIncludes`/`titleIncludes`.
+- **Tab listings include group info.** `formatTab` now reports `groupId` and a `group` record (`title`, `color`, `collapsed`, `windowId`, `piGroup`), and `chrome_tab list` prefixes grouped tabs with `[Group Title]`.
+- Requires the new `tabGroups` extension permission — reload the companion extension after updating.
+
 ## 0.15.29 — 2026-05-31
 
 Strict-CSP support: `chrome_evaluate`, `chrome_snapshot`, `chrome_wait_for`, and `chrome_navigate initScript` now work on pages that block `unsafe-eval`.

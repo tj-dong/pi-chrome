@@ -500,7 +500,7 @@ class ChromeProfileBridge {
 	}
 }
 
-const tabActionValues = ["list", "new", "activate", "close", "version"] as const;
+const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 const CHROME_TOOL_NAMES = [
@@ -1029,20 +1029,25 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, or inspect tabs in the user's existing Chrome profile via the companion extension.",
-		promptSnippet: "List/open/activate/close existing Chrome tabs through the companion extension.",
+		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension.",
+		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
 			url: Type.Optional(Type.String({ description: "URL for action=new." })),
-			targetId: Type.Optional(Type.String({ description: "Chrome tab id for activate/close." })),
+			targetId: Type.Optional(Type.String({ description: "Chrome tab id for activate/close/group/ungroup." })),
+			urlIncludes: Type.Optional(Type.String({ description: "Match the target tab by URL substring for activate/close/group/ungroup." })),
+			titleIncludes: Type.Optional(Type.String({ description: "Match the target tab by title substring for activate/close/group/ungroup." })),
+			group: Type.Optional(Type.Boolean({ description: "action=new only: pass false to open an ungrouped tab. By default every Pi-opened tab joins the window's 'Pi' tab group." })),
+			groupTitle: Type.Optional(Type.String({ description: "Tab group title for action=group (or action=new to open into a named group). Defaults to 'Pi'. Pass an empty string on action=new to opt out of grouping." })),
+			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
 		async execute(_id, params, signal): Promise<ToolTextResult> {
 			const result = await authorizedBridgeSend(`tab.${params.action}`, params, DEFAULT_TIMEOUT_MS, signal);
 			if (params.action === "list") {
-				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number }>;
-				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
+				const tabs = result as Array<{ id: number; title: string; url: string; active: boolean; windowId: number; group?: { title?: string } | null }>;
+				const text = tabs.map((tab) => `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`).join("\n") || "No tabs.";
 				return { content: [{ type: "text", text }], details: { tabs } };
 			}
 			return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
