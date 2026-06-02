@@ -55,6 +55,10 @@ function readPiChromeVersion(): string {
 }
 const PI_CHROME_VERSION = readPiChromeVersion();
 const PI_CHROME_GLOBAL_KEY = "__piChromeProfileBridgeLoaded__";
+// Authorization is kept on globalThis (separate from the singleton flag, which is cleared on
+// reload) so a /reload — which tears down and re-evaluates the module — does not silently drop
+// an active /chrome authorize grant.
+const PI_CHROME_AUTH_KEY = "__piChromeProfileBridgeAuth__";
 const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
 const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -535,6 +539,7 @@ export default function (pi: ExtensionAPI): void {
 	const currentRoot = extensionRoot();
 	const globalState = globalThis as typeof globalThis & {
 		[PI_CHROME_GLOBAL_KEY]?: { version: string; root: string; token?: symbol };
+		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
 	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
@@ -551,6 +556,19 @@ export default function (pi: ExtensionAPI): void {
 	const bridge = new ChromeProfileBridge(DEFAULT_HOST, DEFAULT_PORT);
 	let backgroundDefault = true;
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
+	// Restore an authorization that survived a /reload. Drop it if it already expired.
+	const persistedAuth = globalState[PI_CHROME_AUTH_KEY];
+	if (persistedAuth) {
+		if (persistedAuth.until === "indefinite" || persistedAuth.until > Date.now()) {
+			chromeAuthorizedUntil = persistedAuth.until;
+		} else {
+			delete globalState[PI_CHROME_AUTH_KEY];
+		}
+	}
+	const persistAuth = (): void => {
+		if (chromeAuthorizedUntil === undefined) delete globalState[PI_CHROME_AUTH_KEY];
+		else globalState[PI_CHROME_AUTH_KEY] = { until: chromeAuthorizedUntil };
+	};
 	let chromeToolsRegistered = false;
 	let authExpiryTimer: NodeJS.Timeout | undefined;
 	// Remembered so bridge sends can tag tabs with this session's group even when ctx isn't handy.
@@ -576,6 +594,7 @@ export default function (pi: ExtensionAPI): void {
 	const lockChromeControl = (): void => {
 		clearAuthExpiryTimer();
 		chromeAuthorizedUntil = undefined;
+		persistAuth();
 		deactivateChromeTools();
 	};
 
@@ -662,6 +681,11 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => {
 		sessionCtx = ctx;
 		await bridge.start();
+		// Reestablish in-memory state after a /reload restored chromeAuthorizedUntil from globalThis.
+		if (chromeControlAuthorized()) {
+			activateChromeTools();
+			if (typeof chromeAuthorizedUntil === "number") scheduleAuthExpiry(ctx, chromeAuthorizedUntil);
+		}
 		updateChromeStatus(ctx);
 	});
 
@@ -801,6 +825,7 @@ Usage rules:
 			return;
 		}
 		chromeAuthorizedUntil = until;
+		persistAuth();
 		activateChromeTools();
 		scheduleAuthExpiry(ctx, until);
 		ctx.ui.notify(`Chrome control authorized for ${label}.`, "info");
