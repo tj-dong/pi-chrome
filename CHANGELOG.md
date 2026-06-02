@@ -2,6 +2,11 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.34 — 2026-06-01
+
+- **Every tab Pi uses now joins the session group.** Previously only `chrome_tab new`/`group` created/used the `Pi Session: <name-or-id>` group; tabs Pi drove via `page.*` actions (navigate, click, type, snapshot, screenshot, etc.) on the existing/active tab stayed ungrouped. Now any ungrouped tab Pi interacts with is pulled into this session's group, so the user can see exactly which tabs Pi is driving. Tabs already in a group (the user's or another session's) are left untouched.
+- **Fixed punctuation being dropped by `chrome_type`/`chrome_key`.** Printable punctuation derived its `code`/virtual-keyCode from `charCodeAt()`, so `.` mapped to keyCode 46 (VK_DELETE), `-` to 45 (VK_INSERT), shifted symbols to wrong codes, and `code` was the raw char (`"."`) instead of the physical key (`"Period"`). Apps with keydown handlers (e.g. Gmail's filter address field) saw a Delete/Insert key and silently rejected the character. Both the CDP and DOM-event input paths now resolve keys through a proper US-keyboard layout map.
+
 ## 0.15.33 — 2026-05-31
 
 - **Background is now the default.** `chrome_*` tools run silently without focusing Chrome unless you opt in. Pass `background: false` per call, or run `/chrome background off`, to bring Chrome forward and watch. Tool/param descriptions and docs updated to match.

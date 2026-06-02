@@ -164,6 +164,27 @@ async function run() {
     "waitFor: missing selector times out",
   );
 
+  // ===== usKeyLayoutForChar / cdpKeyInfo: US-layout key codes =====
+  // Regression: punctuation must NOT use charCodeAt() (".":46 collides with VK_DELETE,
+  // "-":45 with VK_INSERT), which made apps drop the char on keydown.
+  const { usKeyLayoutForChar, cdpKeyInfo } = sandbox;
+  const period = usKeyLayoutForChar(".");
+  ok(period.code === "Period" && period.keyCode === 190 && !period.needShift, "keylayout: '.' -> Period/190 (not 46)");
+  const dash = usKeyLayoutForChar("-");
+  ok(dash.code === "Minus" && dash.keyCode === 189, "keylayout: '-' -> Minus/189 (not 45)");
+  const slash = usKeyLayoutForChar("/");
+  ok(slash.code === "Slash" && slash.keyCode === 191, "keylayout: '/' -> Slash/191");
+  const at = usKeyLayoutForChar("@");
+  ok(at.code === "Digit2" && at.keyCode === 50 && at.needShift, "keylayout: '@' -> Digit2/50 + shift");
+  const A = usKeyLayoutForChar("A");
+  ok(A.code === "KeyA" && A.keyCode === 65 && A.needShift, "keylayout: 'A' -> KeyA/65 + shift");
+  const a = usKeyLayoutForChar("a");
+  ok(a.code === "KeyA" && a.keyCode === 65 && !a.needShift, "keylayout: 'a' -> KeyA/65 no shift");
+  const dot = cdpKeyInfo(".");
+  ok(dot.code === "Period" && dot.windowsVirtualKeyCode === 190 && dot.text === ".", "cdpKeyInfo: '.' -> Period/190 with text");
+  const ent = cdpKeyInfo("Enter");
+  ok(ent.code === "Enter" && ent.windowsVirtualKeyCode === 13, "cdpKeyInfo: named key 'Enter' unaffected");
+
   console.log(`\n${passes} passed, ${failures} failed`);
   if (failures) process.exit(1);
 }

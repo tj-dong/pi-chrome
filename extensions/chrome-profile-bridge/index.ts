@@ -553,6 +553,8 @@ export default function (pi: ExtensionAPI): void {
 	let chromeAuthorizedUntil: number | "indefinite" | undefined;
 	let chromeToolsRegistered = false;
 	let authExpiryTimer: NodeJS.Timeout | undefined;
+	// Remembered so bridge sends can tag tabs with this session's group even when ctx isn't handy.
+	let sessionCtx: ExtensionContext | undefined;
 
 	const clearAuthExpiryTimer = (): void => {
 		if (!authExpiryTimer) return;
@@ -632,7 +634,15 @@ export default function (pi: ExtensionAPI): void {
 
 	const authorizedBridgeSend = (action: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS, signal?: AbortSignal): Promise<unknown> => {
 		requireChromeControlAuthorized();
-		return bridge.send(action, params, timeoutMs, signal);
+		// Any tab Pi *uses* (page.* interactions) should join this session's group, mirroring the
+		// auto-grouping that tab.new already does. Tagging the wire params lets getTabByParams pull
+		// the resolved (e.g. active) tab into the session group on the service-worker side. We skip
+		// tab.* actions: tab.new/group group explicitly, and activate/close/ungroup/list must not.
+		const shouldJoinGroup = action.startsWith("page.") && sessionCtx !== undefined && params.sessionGroupTitle === undefined;
+		const wireParams = shouldJoinGroup
+			? { ...params, sessionGroupTitle: sessionGroupTitle(sessionCtx as ExtensionContext), joinSessionGroup: true }
+			: params;
+		return bridge.send(action, wireParams, timeoutMs, signal);
 	};
 
 	// Translate the public `background` parameter (default on = silent/background) into the
@@ -650,6 +660,7 @@ export default function (pi: ExtensionAPI): void {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionCtx = ctx;
 		await bridge.start();
 		updateChromeStatus(ctx);
 	});

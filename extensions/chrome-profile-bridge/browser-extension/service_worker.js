@@ -315,6 +315,38 @@ function cdpModifiersFor(mods) {
   return m;
 }
 
+// Resolve a single printable character to { code, keyCode, needShift } on a US layout.
+// Self-contained (maps defined inline) so it can be serialized into the page via
+// HELPER_FUNCS for the DOM-event fallback as well as used by the CDP path.
+// Using charCodeAt() for punctuation is wrong: e.g. "." is charCode 46 which collides
+// with VK_DELETE, "-" is 45 (VK_INSERT), so app keydown handlers misfire and drop input.
+function usKeyLayoutForChar(ch) {
+  const PUNCT = {
+    "`": { code: "Backquote", keyCode: 192 }, "~": { code: "Backquote", keyCode: 192, shift: true },
+    "-": { code: "Minus", keyCode: 189 }, "_": { code: "Minus", keyCode: 189, shift: true },
+    "=": { code: "Equal", keyCode: 187 }, "+": { code: "Equal", keyCode: 187, shift: true },
+    "[": { code: "BracketLeft", keyCode: 219 }, "{": { code: "BracketLeft", keyCode: 219, shift: true },
+    "]": { code: "BracketRight", keyCode: 221 }, "}": { code: "BracketRight", keyCode: 221, shift: true },
+    "\\": { code: "Backslash", keyCode: 220 }, "|": { code: "Backslash", keyCode: 220, shift: true },
+    ";": { code: "Semicolon", keyCode: 186 }, ":": { code: "Semicolon", keyCode: 186, shift: true },
+    "'": { code: "Quote", keyCode: 222 }, "\"": { code: "Quote", keyCode: 222, shift: true },
+    ",": { code: "Comma", keyCode: 188 }, "<": { code: "Comma", keyCode: 188, shift: true },
+    ".": { code: "Period", keyCode: 190 }, ">": { code: "Period", keyCode: 190, shift: true },
+    "/": { code: "Slash", keyCode: 191 }, "?": { code: "Slash", keyCode: 191, shift: true },
+    " ": { code: "Space", keyCode: 32 },
+  };
+  // Shifted digit symbols share the digit's physical code + keyCode.
+  const SHIFT_DIGIT = { ")": "0", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9" };
+  if (/^[a-z]$/.test(ch)) return { code: `Key${ch.toUpperCase()}`, keyCode: ch.toUpperCase().charCodeAt(0), needShift: false };
+  if (/^[A-Z]$/.test(ch)) return { code: `Key${ch}`, keyCode: ch.charCodeAt(0), needShift: true };
+  if (/^[0-9]$/.test(ch)) return { code: `Digit${ch}`, keyCode: ch.charCodeAt(0), needShift: false };
+  if (SHIFT_DIGIT[ch]) { const d = SHIFT_DIGIT[ch]; return { code: `Digit${d}`, keyCode: d.charCodeAt(0), needShift: true }; }
+  const p = PUNCT[ch];
+  if (p) return { code: p.code, keyCode: p.keyCode, needShift: !!p.shift };
+  // Unknown char (e.g. unicode): keep text-driven insertion, avoid bogus keyCode collisions.
+  return { code: ch, keyCode: 0, needShift: false };
+}
+
 function cdpKeyInfo(key, shifted) {
   // Map common keys to CDP key event init fields. Returns { code, key, windowsVirtualKeyCode, text }.
   const SPECIAL = {
@@ -336,11 +368,8 @@ function cdpKeyInfo(key, shifted) {
   if (SPECIAL[key]) return { key, ...SPECIAL[key] };
   if (key.length === 1) {
     const ch = key;
-    let code, vk;
-    if (/^[a-zA-Z]$/.test(ch)) { code = `Key${ch.toUpperCase()}`; vk = ch.toUpperCase().charCodeAt(0); }
-    else if (/^[0-9]$/.test(ch)) { code = `Digit${ch}`; vk = ch.charCodeAt(0); }
-    else { code = ch; vk = ch.charCodeAt(0); }
-    return { key: ch, code, windowsVirtualKeyCode: vk, text: ch };
+    const layout = usKeyLayoutForChar(ch);
+    return { key: ch, code: layout.code, windowsVirtualKeyCode: layout.keyCode, text: ch };
   }
   return { key, code: key, windowsVirtualKeyCode: 0, text: "" };
 }
@@ -937,7 +966,25 @@ async function getTabByParams(params) {
   if ((tab.url || "").startsWith("chrome://") || (tab.url || "").startsWith("chrome-extension://")) {
     throw new Error(`Chrome blocks extension automation on protected URL: ${tab.url}`);
   }
+  // Tabs Pi interacts with (page.* actions) join this session's group so the user can see exactly
+  // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
+  // another Pi session) already grouped, since groupTab would otherwise rename that group.
+  if (params.joinSessionGroup && params.sessionGroupTitle) {
+    await joinSessionGroup(tab, params.sessionGroupTitle);
+  }
   return tab;
+}
+
+// Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
+// No-op when the tab is already grouped or tabGroups is unavailable.
+async function joinSessionGroup(tab, title) {
+  if (!chrome.tabGroups || typeof tab.id !== "number") return;
+  if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
+  try {
+    await groupTab(tab, title);
+  } catch {
+    // Grouping is best-effort; never block the actual page action on a grouping failure.
+  }
 }
 
 // Helper sources that get concatenated into the injected MAIN-world script. Kept as separate
@@ -961,6 +1008,7 @@ const HELPER_FUNCS = [
   dispatchPointerLikeEvent,
   humanMoveTo,
   humanClickPoint,
+  usKeyLayoutForChar,
   printableKeyCode,
   dispatchKeyEvent,
   typeCharacter,
@@ -1974,19 +2022,13 @@ function setNativeValue(element, value) {
 }
 
 function printableKeyCode(ch) {
-  if (ch === " ") return 32;
-  const upper = ch.toUpperCase();
-  if (/^[A-Z]$/.test(upper)) return upper.charCodeAt(0);
-  if (/^[0-9]$/.test(ch)) return ch.charCodeAt(0);
-  return ch.charCodeAt(0) || 0;
+  return ch.length === 1 ? usKeyLayoutForChar(ch).keyCode : 0;
 }
 
 function dispatchKeyEvent(element, type, key, mods = {}) {
-  const code = key.length === 1 && /^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` :
-    key.length === 1 && /^[0-9]$/.test(key) ? `Digit${key}` :
-    key === " " ? "Space" : key;
   const SPECIAL = { Enter: 13, Tab: 9, Backspace: 8, Delete: 46, Escape: 27,
     ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, " ": 32, Shift: 16, Control: 17, Alt: 18, Meta: 91 };
+  const code = key.length === 1 ? usKeyLayoutForChar(key).code : (key === " " ? "Space" : key);
   const keyCode = key.length === 1 ? printableKeyCode(key) : (SPECIAL[key] ?? 0);
   const ev = new KeyboardEvent(type, {
     key,
