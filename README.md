@@ -140,7 +140,7 @@ Agents can verify page state immediately instead of blindly retrying.
 | Category        | Tools                                                                                          |
 | --------------- | ---------------------------------------------------------------------------------------------- |
 | **Tabs**        | `chrome_tab` (list/new/activate/close/version), `chrome_launch`                                |
-| **Inspect**     | `chrome_snapshot` (uids + selectors + text + viewport), `chrome_screenshot`, `chrome_evaluate` |
+| **Inspect**     | `chrome_snapshot` (concise observation: layout, actions, forms, page map, query matches, diff + stable uids), `chrome_find` (query → ranked uids), `chrome_inspect` (deep single-element context), `chrome_screenshot`, `chrome_evaluate` |
 | **Navigate**    | `chrome_navigate` (with optional `initScript` at `document_start`), `chrome_wait_for`          |
 | **Interact**    | `chrome_click`, `chrome_type`, `chrome_fill`, `chrome_key`, `chrome_hover`                     |
 | **Gesture**     | `chrome_drag` (Chrome pointer drag), `chrome_scroll` (wheel + momentum), `chrome_tap` (touch)  |
