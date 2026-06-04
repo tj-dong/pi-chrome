@@ -833,12 +833,9 @@ async function dispatch(action, params) {
       return { closed: tab.id };
     }
     case "page.snapshot":
-      return executeInTab(params, snapshotPage, [
-        params.maxElements || 80,
-        params.containingText ?? null,
-        params.roleFilter ?? null,
-        params.nearUid ?? null,
-      ]);
+      return snapshotInTab(params);
+    case "page.inspect":
+      return inspectInTab(params);
     case "page.evaluate":
       return evaluateInTab(params);
     case "page.click":
@@ -1120,10 +1117,93 @@ async function evaluateInTab(params) {
 async function withOptionalSnapshot(params, actionFn) {
   const result = await actionFn(params);
   if (params.includeSnapshot) {
-    const snapshot = await executeInTab({ ...params, foreground: false }, snapshotPage, [params.maxElements || 80, null, null, null]);
+    const snapshot = await snapshotInTab({ ...params, foreground: false });
     return { result, snapshot };
   }
   return result;
+}
+
+// Snapshot/inspect run from a packaged MAIN-world script (snapshot_injected.js) injected via
+// chrome.scripting.executeScript({ files }). That file is free of eval/new Function, so it works
+// on strict-CSP pages, and it installs globalThis.__piChromeSnapshotPage / __piChromeInspectTarget.
+// It shares window.__PI_CHROME_STATE__ (same el- uid scheme) with the CDP-injected input helpers.
+async function snapshotInTab(params) {
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  const args = [
+    params.maxElements || 80,
+    params.containingText ?? null,
+    params.roleFilter ?? null,
+    params.nearUid ?? null,
+    params.mode || "auto",
+    params.query ?? null,
+    params.maxTextChars ?? null,
+  ];
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    files: ["snapshot_injected.js"],
+  });
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    func: async (invocationArgs) => {
+      try {
+        const snapshotPage = globalThis.__piChromeSnapshotPage;
+        if (typeof snapshotPage !== "function") throw new Error("snapshot_injected.js did not install __piChromeSnapshotPage");
+        return { ok: true, value: await snapshotPage(...invocationArgs) };
+      } catch (error) {
+        return { ok: false, error: error?.stack || error?.message || String(error) };
+      }
+    },
+    args: [args],
+  });
+  const first = results?.[0];
+  if (first?.error) {
+    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
+    throw new Error(message);
+  }
+  const envelope = first?.result;
+  if (envelope && typeof envelope === "object" && envelope.ok === false) {
+    throw new Error(envelope.error || "Chrome snapshot script failed");
+  }
+  return envelope?.value;
+}
+
+async function inspectInTab(params) {
+  if (!params.uid && !params.selector) throw new Error("chrome_inspect requires uid or selector");
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    files: ["snapshot_injected.js"],
+  });
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id, frameIds: [0] },
+    world: "MAIN",
+    func: async (invocationArgs) => {
+      try {
+        const inspectTarget = globalThis.__piChromeInspectTarget;
+        if (typeof inspectTarget !== "function") throw new Error("snapshot_injected.js did not install __piChromeInspectTarget");
+        return { ok: true, value: await inspectTarget(...invocationArgs) };
+      } catch (error) {
+        return { ok: false, error: error?.stack || error?.message || String(error) };
+      }
+    },
+    args: [args],
+  });
+  const first = results?.[0];
+  if (first?.error) {
+    const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
+    throw new Error(message);
+  }
+  const envelope = first?.result;
+  if (envelope && typeof envelope === "object" && envelope.ok === false) {
+    throw new Error(envelope.error || "Chrome inspect script failed");
+  }
+  return envelope?.value;
 }
 
 // One-shot init script registry, scoped per tab. The source is registered with CDP
@@ -1640,104 +1720,6 @@ function installEarlyCapture() {
     };
   }
   state.instrumentationInstalled = true;
-}
-
-function snapshotPage(maxElements, containingText, roleFilter, nearUid) {
-  installPiChromeInstrumentation();
-  const unique = (selector) => {
-    try { return document.querySelectorAll(selector).length === 1; } catch { return false; }
-  };
-  const cssEscape = (value) => (window.CSS && CSS.escape) ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
-  const selectorFor = (element) => {
-    if (element.id && unique("#" + cssEscape(element.id))) return "#" + cssEscape(element.id);
-    const attr = ["aria-label", "name", "placeholder", "data-testid", "role"].find((name) => element.getAttribute(name));
-    if (attr) {
-      const candidate = element.tagName.toLowerCase() + "[" + attr + "=" + JSON.stringify(element.getAttribute(attr)) + "]";
-      if (unique(candidate)) return candidate;
-    }
-    const parts = [];
-    let current = element;
-    while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 5) {
-      let part = current.tagName.toLowerCase();
-      if (current.classList.length > 0) part += "." + Array.from(current.classList).slice(0, 2).map(cssEscape).join(".");
-      const siblings = Array.from(current.parentElement?.children ?? []).filter((sibling) => sibling.tagName === current.tagName);
-      if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(current) + 1) + ")";
-      parts.unshift(part);
-      const candidate = parts.join(" > ");
-      if (unique(candidate)) return candidate;
-      current = current.parentElement;
-    }
-    return parts.join(" > ");
-  };
-  const visible = (element) => isElementVisible(element);
-  const labelFor = (element) => (
-    element.getAttribute("aria-label") ||
-    element.getAttribute("title") ||
-    element.getAttribute("placeholder") ||
-    element.innerText ||
-    element.value ||
-    element.textContent ||
-    ""
-  ).trim().replace(/\s+/g, " ").slice(0, 160);
-  let candidates = Array.from(document.querySelectorAll('a, button, input, textarea, select, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="checkbox"], [contenteditable="true"], [tabindex]:not([tabindex="-1"])'));
-  if (containingText) {
-    const needle = String(containingText).toLowerCase();
-    candidates = candidates.filter((element) => labelFor(element).toLowerCase().includes(needle));
-  }
-  if (roleFilter) {
-    const wanted = String(roleFilter).toLowerCase();
-    candidates = candidates.filter((element) => {
-      const role = (element.getAttribute("role") || element.tagName).toLowerCase();
-      return role === wanted;
-    });
-  }
-  let near;
-  if (nearUid) {
-    const state = getPiChromeState();
-    near = state.elements[nearUid];
-  }
-  if (near) {
-    const nearRect = near.getBoundingClientRect();
-    const cx = nearRect.left + nearRect.width / 2;
-    const cy = nearRect.top + nearRect.height / 2;
-    candidates.sort((a, b) => {
-      const ra = a.getBoundingClientRect();
-      const rb = b.getBoundingClientRect();
-      const da = Math.hypot(ra.left + ra.width / 2 - cx, ra.top + ra.height / 2 - cy);
-      const db = Math.hypot(rb.left + rb.width / 2 - cx, rb.top + rb.height / 2 - cy);
-      return da - db;
-    });
-  }
-  const elements = candidates.filter(visible).slice(0, maxElements).map((element, index) => {
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const occluded = occluderAt(cx, cy, element);
-    return {
-      index,
-      uid: rememberElement(element),
-      tag: element.tagName.toLowerCase(),
-      selector: selectorFor(element),
-      label: labelFor(element),
-      href: element.href || undefined,
-      type: element.getAttribute("type") || undefined,
-      role: element.getAttribute("role") || undefined,
-      disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
-      inert: Boolean(element.closest?.("[inert]")),
-      pointerEvents: style.pointerEvents,
-      occluded: occluded || undefined,
-      rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
-    };
-  });
-  return {
-    title: document.title,
-    url: location.href,
-    viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
-    text: document.body ? document.body.innerText.replace(/\s+\n/g, "\n").trim().slice(0, 30000) : "",
-    elements,
-    filter: { containingText: containingText || undefined, roleFilter: roleFilter || undefined, nearUid: nearUid || undefined },
-  };
 }
 
 function probePage() {
