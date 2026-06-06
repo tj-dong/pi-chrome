@@ -4,7 +4,7 @@ All notable user-facing changes to `pi-chrome`.
 
 ## 0.15.36 — 2026-06-03
 
-- **Richer page observation (ported from the `foxfirecodes` fork).** `chrome_snapshot` now returns a concise, agent-friendly observation — structural layout/context, page hints, visible actions, form fields, a page map, query matches, and a diff of changes since the previous snapshot — instead of a raw JSON dump. New `mode` (`auto`/`interactive`/`forms`/`pageMap`/`text`/`changes`/`full`), `query`, and `maxTextChars` parameters let the agent zoom in instead of dumping the whole page.
+- **Richer page observation.** `chrome_snapshot` now returns a concise, agent-friendly observation — structural layout/context, page hints, visible actions, form fields, a page map, query matches, and a diff of changes since the previous snapshot — instead of a raw JSON dump. New `mode` (`auto`/`interactive`/`forms`/`pageMap`/`text`/`changes`/`full`), `query`, and `maxTextChars` parameters let the agent zoom in instead of dumping the whole page.
 - **New `chrome_find` tool.** Find elements, regions, or text by natural-language query (`'merge button'`, `'email error'`) and get ranked matches with stable uids and coordinates. Thin wrapper around `chrome_snapshot({ query })`.
 - **New `chrome_inspect` tool.** Inspect one snapshot uid/selector deeply: nearby text, nearby actions, form context, ancestors, and a suggested click target. Falls back to a focused snapshot if the loaded extension predates `page.inspect`.
 - **`includeSnapshot` now embeds the formatted snapshot.** `chrome_click`/`chrome_type`/`chrome_fill`/`chrome_key` with `includeSnapshot=true` append the fresh concise snapshot to the tool text so the agent can verify in one round trip.
