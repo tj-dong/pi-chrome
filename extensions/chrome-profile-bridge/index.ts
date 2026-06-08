@@ -702,6 +702,7 @@ export default function (pi: ExtensionAPI): void {
 	};
 	let chromeToolsRegistered = false;
 	let authExpiryTimer: NodeJS.Timeout | undefined;
+	let countdownInterval: NodeJS.Timeout | undefined;
 	// Remembered so bridge sends can tag tabs with this session's group even when ctx isn't handy.
 	let sessionCtx: ExtensionContext | undefined;
 
@@ -709,6 +710,12 @@ export default function (pi: ExtensionAPI): void {
 		if (!authExpiryTimer) return;
 		clearTimeout(authExpiryTimer);
 		authExpiryTimer = undefined;
+	};
+
+	const clearCountdownInterval = (): void => {
+		if (!countdownInterval) return;
+		clearInterval(countdownInterval);
+		countdownInterval = undefined;
 	};
 
 	const activeToolNamesWithoutChrome = (): string[] => pi.getActiveTools().filter((name) => !CHROME_TOOL_NAME_SET.has(name));
@@ -724,6 +731,7 @@ export default function (pi: ExtensionAPI): void {
 
 	const lockChromeControl = (): void => {
 		clearAuthExpiryTimer();
+		clearCountdownInterval();
 		chromeAuthorizedUntil = undefined;
 		persistAuth();
 		deactivateChromeTools();
@@ -759,16 +767,42 @@ export default function (pi: ExtensionAPI): void {
 		return `Pi Session: ${name || id || "unknown"}`;
 	};
 
+	const authCountdownLabel = (): string => {
+		if (chromeAuthorizedUntil === "indefinite") return " (indefinite)";
+		if (typeof chromeAuthorizedUntil === "number") {
+			const remainingMs = chromeAuthorizedUntil - Date.now();
+			if (remainingMs > 0) {
+				const mins = Math.ceil(remainingMs / 60_000);
+				return mins >= 1 ? ` (${mins}m)` : " (<1m)";
+			}
+		}
+		return "";
+	};
+
 	const updateChromeStatus = (ctx: ExtensionContext): void => {
 		if (chromeControlAuthorized()) {
-			ctx.ui.setStatus("chrome", ctx.ui.theme.fg("success", "●") + " Chrome Bridge");
+			ctx.ui.setStatus("chrome", ctx.ui.theme.fg("success", "●") + " Chrome Bridge" + authCountdownLabel());
 		} else {
 			ctx.ui.setStatus("chrome", undefined);
 		}
 	};
 
+	// Ticks every 60 s while a timed authorization is active to keep the countdown current.
+	const startCountdownTicker = (ctx: ExtensionContext): void => {
+		clearCountdownInterval();
+		if (chromeAuthorizedUntil === "indefinite" || typeof chromeAuthorizedUntil !== "number") return;
+		countdownInterval = setInterval(() => {
+			if (!chromeControlAuthorized()) {
+				clearCountdownInterval();
+				return;
+			}
+			updateChromeStatus(ctx);
+		}, 60_000);
+	};
+
 	const scheduleAuthExpiry = (ctx: ExtensionContext, until: number | "indefinite"): void => {
 		clearAuthExpiryTimer();
+		startCountdownTicker(ctx);
 		if (until === "indefinite") return;
 		authExpiryTimer = setTimeout(() => {
 			if (chromeAuthorizedUntil !== until) return;
@@ -816,12 +850,14 @@ export default function (pi: ExtensionAPI): void {
 		if (chromeControlAuthorized()) {
 			activateChromeTools();
 			if (typeof chromeAuthorizedUntil === "number") scheduleAuthExpiry(ctx, chromeAuthorizedUntil);
+			else if (chromeAuthorizedUntil === "indefinite") startCountdownTicker(ctx);
 		}
 		updateChromeStatus(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
 		clearAuthExpiryTimer();
+		clearCountdownInterval();
 		bridge.stop();
 		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
 			delete globalState[PI_CHROME_GLOBAL_KEY];
