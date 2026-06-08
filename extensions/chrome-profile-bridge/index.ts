@@ -1478,6 +1478,7 @@ Usage rules:
 			uid: Type.Optional(Type.String({ description: "Stable element uid from chrome_snapshot." })),
 			selector: Type.Optional(Type.String({ description: "CSS selector to fill if uid is omitted." })),
 			submit: Type.Optional(Type.Boolean({ description: "If true, press Enter after filling." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM value-setting if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after filling." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),
