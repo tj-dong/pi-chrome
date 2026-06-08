@@ -2,6 +2,10 @@
 
 All notable user-facing changes to `pi-chrome`.
 
+## 0.15.38 — 2026-06-07
+
+- **Overlay-safe click/fill fallbacks.** `chrome_click` and `chrome_fill` now fall back to DOM-dispatched click/value events when Chrome's debugger input path is blocked by another extension overlay (for example password-manager/autofill UI), unless `domFallback:false` is passed.
+
 ## 0.15.37 — 2026-06-07
 
 - **Hardened Chrome input targeting.** `chrome_click`/`chrome_fill`/related input paths now fail fast with resolved tab/CDP target metadata when debugger attach hits a stale or protected target, instead of surfacing bare `chrome-extension://` errors or hanging until the bridge timeout.

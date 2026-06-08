@@ -1413,6 +1413,7 @@ Usage rules:
 			selector: Type.Optional(Type.String({ description: "CSS selector to click. Prefer uid from chrome_snapshot when available." })),
 			x: Type.Optional(Type.Number({ description: "Viewport x coordinate if uid/selector is omitted." })),
 			y: Type.Optional(Type.Number({ description: "Viewport y coordinate if uid/selector is omitted." })),
+			domFallback: Type.Optional(Type.Boolean({ description: "If true (default), fall back to DOM-dispatched click if Chrome's CDP input path is blocked by another extension overlay or debugger failure." })),
 			includeSnapshot: Type.Optional(Type.Boolean({ description: "If true, include a fresh chrome_snapshot result after the click." })),
 			maxElements: Type.Optional(Type.Number({ default: MAX_ELEMENTS, description: "Max elements in the included snapshot." })),
 			targetId: Type.Optional(Type.String()),

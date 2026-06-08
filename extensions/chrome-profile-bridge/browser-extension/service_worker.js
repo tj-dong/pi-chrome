@@ -7,7 +7,7 @@ const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "p
 const COMMAND_TIMEOUT_MS = 25_000;
 const CDP_COMMAND_TIMEOUT_MS = 5_000;
 const SCRIPTING_TIMEOUT_MS = 8_000;
-const ATTACH_TIMEOUT_MS = 8_000;
+const ATTACH_TIMEOUT_MS = 3_000;
 let polling = false;
 
 function withTimeout(promise, ms, label, onTimeout) {
@@ -479,36 +479,70 @@ async function cdpTypeChar(tabId, ch) {
   await sleep(rng(35, 130));
 }
 
+async function domClickFallback(tabId, params, cause) {
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid, x, y) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (uid && (!el || !el.isConnected)) return { staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot`, url: location.href };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el && typeof x === "number" && typeof y === "number") el = document.elementFromPoint(x, y);
+      if (!el) throw new Error(`DOM fallback target not found: ${uid || selector || `${x},${y}`}`);
+      el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      const rect = el.getBoundingClientRect();
+      const eventInit = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1 };
+      el.dispatchEvent(new PointerEvent("pointerdown", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      el.dispatchEvent(new MouseEvent("mousedown", eventInit));
+      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      el.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
+      el.click();
+      return { tag: el.tagName, url: location.href };
+    },
+    args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
+  }, `DOM click fallback in tab ${tabId}`);
+  const v = results?.[0]?.result;
+  if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
+  return { input: "dom-fallback", reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+}
+
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  await attachDebugger(tab.id);
-  const resolved = await resolveTargetInTab(tab.id, params);
-  const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
-  await cdpMoveTo(tab.id, point.x, point.y);
-  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
-  await sleep(rng(45, 140));
-  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
-  // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
-  // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
-  // Reset focus styling after pointer click when possible.
-  if (params.selector || params.uid) {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, frameIds: [0] },
-      world: "MAIN",
-      func: (sel, uid) => {
-        const state = window.__PI_CHROME_STATE__;
-        let el = null;
-        if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
-        else if (sel) el = document.querySelector(sel);
-        if (el && typeof el.focus === "function" && el === document.activeElement) {
-          try { el.blur(); el.focus({ preventScroll: true, focusVisible: false }); } catch {}
-        }
-      },
-      args: [params.selector ?? null, params.uid ?? null],
-    }).catch(() => undefined);
+  try {
+    await attachDebugger(tab.id);
+    const resolved = await resolveTargetInTab(tab.id, params);
+    const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+    await cdpMoveTo(tab.id, point.x, point.y);
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
+    await sleep(rng(45, 140));
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
+    // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
+    // Reset focus styling after pointer click when possible.
+    if (params.selector || params.uid) {
+      await executeScriptTimed({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "MAIN",
+        func: (sel, uid) => {
+          const state = window.__PI_CHROME_STATE__;
+          let el = null;
+          if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
+          else if (sel) el = document.querySelector(sel);
+          if (el && typeof el.focus === "function" && el === document.activeElement) {
+            try { el.blur(); el.focus({ preventScroll: true, focusVisible: false }); } catch {}
+          }
+        },
+        args: [params.selector ?? null, params.uid ?? null],
+      }, `reset focus style in tab ${tab.id}`).catch(() => undefined);
+    }
+    return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
+  } catch (error) {
+    if (params.domFallback === false) throw error;
+    return domClickFallback(tab.id, params, error);
   }
-  return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
 }
 
 async function chromeInputHover(params) {
