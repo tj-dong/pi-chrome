@@ -4,7 +4,24 @@ const POLL_ERROR_BACKOFF_MS = 2000;
 const DEFAULT_GROUP_COLOR = "blue";
 const PI_GROUP_RE = /^Pi(\b|\s*-)/i;
 const VALID_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
+const COMMAND_TIMEOUT_MS = 25_000;
+const CDP_COMMAND_TIMEOUT_MS = 5_000;
+const SCRIPTING_TIMEOUT_MS = 8_000;
+const ATTACH_TIMEOUT_MS = 3_000;
 let polling = false;
+
+function withTimeout(promise, ms, label, onTimeout) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise).finally(() => clearTimeout(timer)),
+    new Promise((_, reject) => {
+      timer = setTimeout(async () => {
+        try { await onTimeout?.(); } catch {}
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      }, ms);
+    }),
+  ]);
+}
 
 // =================== Chrome input (CDP) layer ===================
 // Tracks which tabs we have attached chrome.debugger to.
@@ -29,6 +46,31 @@ function recordAttachEvent(entry) {
   if (attachDebugLog.length > 20) attachDebugLog.shift();
 }
 
+function normalPageTarget(target, tabId) {
+  const url = String(target?.url || "");
+  return target?.tabId === tabId && target?.type === "page" && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://") && !url.startsWith("devtools://");
+}
+
+async function pageDebuggeeForTab(tabId) {
+  const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+  const target = targets.find((t) => normalPageTarget(t, tabId));
+  return target?.id ? { targetId: target.id } : { tabId };
+}
+
+async function debuggerAttachRaw(tabId, preferredDebuggee) {
+  const debuggee = preferredDebuggee || { tabId };
+  await withTimeout(
+    chrome.debugger.attach(debuggee, CDP_VERSION),
+    ATTACH_TIMEOUT_MS,
+    `Chrome debugger attach to tab ${tabId}`,
+    async () => {
+      attachedTabs.delete(tabId);
+      try { await chrome.debugger.detach(debuggee); } catch {}
+    },
+  );
+  return debuggee;
+}
+
 async function attachDebugger(tabId) {
   if (!chrome.debugger) throw new Error("chrome.debugger API unavailable; reload the extension to grant the new permission");
   if (attachedTabs.has(tabId)) {
@@ -50,15 +92,23 @@ async function attachDebugger(tabId) {
       }
     }
   } catch {}
-  const attemptAttach = async () => {
+  let attachedDebuggee = null;
+  const attemptAttach = async (debuggee) => {
     try {
-      await chrome.debugger.attach({ tabId }, CDP_VERSION);
+      attachedDebuggee = await debuggerAttachRaw(tabId, debuggee);
       return null;
     } catch (error) {
       return error;
     }
   };
+  const retryPageTargetIfExtensionBlocked = async (err, kind) => {
+    if (!/Cannot access a chrome-extension:\/\/ URL of different extension/i.test(String(err?.message || err))) return err;
+    const pageDebuggee = await pageDebuggeeForTab(tabId);
+    recordAttachEvent({ kind, tabId, debuggee: pageDebuggee });
+    return attemptAttach(pageDebuggee);
+  };
   let err = await attemptAttach();
+  if (err) err = await retryPageTargetIfExtensionBlocked(err, "attach-page-target-retry");
   if (err) {
     const msg = String(err?.message || err);
     const transient = /Cannot access a chrome-extension|Cannot access contents of|No tab with id|Debugger is not attached|Another debugger|Target closed/i.test(msg);
@@ -70,6 +120,7 @@ async function attachDebugger(tabId) {
     }
     await sleep(180);
     err = await attemptAttach();
+    if (err) err = await retryPageTargetIfExtensionBlocked(err, "attach-page-target-retry2");
     if (err) {
       recordAttachEvent({ kind: "attach-retry-failed", tabId, message: String(err.message || err), tabUrl: tabSnapshot?.url });
       // One more try after a longer settle. Some Chrome builds need ~500ms after a navigation
@@ -77,37 +128,53 @@ async function attachDebugger(tabId) {
       // will accept the target.
       await sleep(500);
       err = await attemptAttach();
+      if (err) err = await retryPageTargetIfExtensionBlocked(err, "attach-page-target-retry3");
       if (err) {
         recordAttachEvent({ kind: "attach-retry2-failed", tabId, message: String(err.message || err), tabUrl: tabSnapshot?.url });
-        throw err;
+        const meta = await describeInputTarget(tabId);
+        throw new Error(`Chrome debugger attach failed for tab ${tabId}: ${String(err.message || err)}${targetMetaSuffix(meta)}`);
       }
     }
   }
-  recordAttachEvent({ kind: "attached", tabId });
+  recordAttachEvent({ kind: "attached", tabId, debuggee: attachedDebuggee });
   // Seed pointer in a plausible "just left the address bar" location.
-  const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } };
+  const entry = { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 }, debuggee: attachedDebuggee || { tabId } };
   attachedTabs.set(tabId, entry);
   return entry;
 }
 
-async function inputDebug(params) {
-  const tab = params?.targetId ? await chrome.tabs.get(Number(params.targetId)).catch(() => null) : null;
+async function describeInputTarget(tabId) {
+  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
   let targets = [];
   try { targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))); } catch {}
   return {
+    resolvedTab: tab ? { id: tab.id, windowId: tab.windowId, url: tab.url, status: tab.status, title: tab.title, active: tab.active } : null,
+    activeTab: active ? { id: active.id, windowId: active.windowId, url: active.url, status: active.status, title: active.title, active: active.active } : null,
+    attachedTabs: Array.from(attachedTabs.keys()),
+    cdpTargets: targets.map((t) => ({ id: t.id, tabId: t.tabId, type: t.type, url: t.url, attached: t.attached, extensionId: t.extensionId })),
+  };
+}
+
+function targetMetaSuffix(meta) {
+  return `\nTarget metadata: ${JSON.stringify(meta).slice(0, 4000)}`;
+}
+
+async function inputDebug(params) {
+  const requested = params?.targetId ? await describeInputTarget(Number(params.targetId)) : await describeInputTarget(-1);
+  return {
     extensionVersion: chrome.runtime.getManifest().version,
     extensionId: chrome.runtime.id,
-    attachedTabs: Array.from(attachedTabs.keys()),
-    requestedTab: tab ? { id: tab.id, url: tab.url, status: tab.status, title: tab.title } : null,
-    cdpTargets: targets,
+    ...requested,
     recentAttachEvents: attachDebugLog.slice(),
   };
 }
 
 async function detachDebugger(tabId) {
-  if (!attachedTabs.has(tabId)) return;
+  const entry = attachedTabs.get(tabId);
+  if (!entry) return;
   attachedTabs.delete(tabId);
-  try { await chrome.debugger.detach({ tabId }); } catch {}
+  try { await chrome.debugger.detach(entry.debuggee || { tabId }); } catch {}
 }
 
 async function detachAll() {
@@ -134,12 +201,20 @@ setInterval(() => {
 }, 5000);
 
 function cdpRaw(tabId, method, params) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
+  const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+  return withTimeout(new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
+  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`, async () => {
+    attachedTabs.delete(tabId);
+    try { await chrome.debugger.detach(debuggee); } catch {}
   });
+}
+
+function executeScriptTimed(options, label) {
+  return withTimeout(chrome.scripting.executeScript(options), SCRIPTING_TIMEOUT_MS, label || "chrome.scripting.executeScript");
 }
 
 // Wraps cdpRaw with one auto-recover on detached/closed sessions:
@@ -214,8 +289,7 @@ async function cdp(tabId, method, params) {
     }
     if (!isStale) throw error;
     attachedTabs.delete(tabId);
-    await chrome.debugger.attach({ tabId }, CDP_VERSION).catch(() => undefined);
-    attachedTabs.set(tabId, { detachAt: Date.now() + INPUT_IDLE_DETACH_MS, pointer: { x: 120 + Math.random() * 200, y: 80 + Math.random() * 120 } });
+    await attachDebugger(tabId).catch(() => undefined);
     return cdpRaw(tabId, method, params);
   }
 }
@@ -254,14 +328,18 @@ function cdpIsSyntaxError(details) {
 
 // Resolve target -> {x, y, rect} in viewport coords by running tiny script in tab.
 async function resolveTargetInTab(tabId, params) {
-  const results = await chrome.scripting.executeScript({
+  const results = await executeScriptTimed({
     target: { tabId, frameIds: [0] },
     world: "MAIN",
     func: (selector, uid, x, y) => {
       const state = window.__PI_CHROME_STATE__;
       let el = null;
-      if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
-      else if (selector) el = document.querySelector(selector);
+      if (uid) {
+        el = state && state.elements ? state.elements[uid] : null;
+        if (!el || !el.isConnected) return { found: false, staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot`, url: location.href };
+      } else if (selector) {
+        el = document.querySelector(selector);
+      }
       if (el) {
         el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         const r = el.getBoundingClientRect();
@@ -271,8 +349,9 @@ async function resolveTargetInTab(tabId, params) {
       return { found: false };
     },
     args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
-  });
+  }, `resolve input target in tab ${tabId}`);
   const v = results?.[0]?.result;
+  if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
   if (!v || !v.found) throw new Error("Could not resolve target element for Chrome input");
   return v;
 }
@@ -400,36 +479,70 @@ async function cdpTypeChar(tabId, ch) {
   await sleep(rng(35, 130));
 }
 
+async function domClickFallback(tabId, params, cause) {
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: (selector, uid, x, y) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (uid && (!el || !el.isConnected)) return { staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot`, url: location.href };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el && typeof x === "number" && typeof y === "number") el = document.elementFromPoint(x, y);
+      if (!el) throw new Error(`DOM fallback target not found: ${uid || selector || `${x},${y}`}`);
+      el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      const rect = el.getBoundingClientRect();
+      const eventInit = { bubbles: true, cancelable: true, view: window, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 0, buttons: 1 };
+      el.dispatchEvent(new PointerEvent("pointerdown", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      el.dispatchEvent(new MouseEvent("mousedown", eventInit));
+      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      el.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
+      el.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
+      el.click();
+      return { tag: el.tagName, url: location.href };
+    },
+    args: [params.selector ?? null, params.uid ?? null, params.x ?? null, params.y ?? null],
+  }, `DOM click fallback in tab ${tabId}`);
+  const v = results?.[0]?.result;
+  if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
+  return { input: "dom-fallback", reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+}
+
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  await attachDebugger(tab.id);
-  const resolved = await resolveTargetInTab(tab.id, params);
-  const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
-  await cdpMoveTo(tab.id, point.x, point.y);
-  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
-  await sleep(rng(45, 140));
-  await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
-  // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
-  // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
-  // Reset focus styling after pointer click when possible.
-  if (params.selector || params.uid) {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id, frameIds: [0] },
-      world: "MAIN",
-      func: (sel, uid) => {
-        const state = window.__PI_CHROME_STATE__;
-        let el = null;
-        if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
-        else if (sel) el = document.querySelector(sel);
-        if (el && typeof el.focus === "function" && el === document.activeElement) {
-          try { el.blur(); el.focus({ preventScroll: true, focusVisible: false }); } catch {}
-        }
-      },
-      args: [params.selector ?? null, params.uid ?? null],
-    }).catch(() => undefined);
+  try {
+    await attachDebugger(tab.id);
+    const resolved = await resolveTargetInTab(tab.id, params);
+    const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+    await cdpMoveTo(tab.id, point.x, point.y);
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse", force: 0.5 });
+    await sleep(rng(45, 140));
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    // Reset :focus-visible if the click landed on a focusable element. CDP-driven pointer
+    // focus can leave :focus-visible=true in Chromium, which trips heuristics that expect
+    // Reset focus styling after pointer click when possible.
+    if (params.selector || params.uid) {
+      await executeScriptTimed({
+        target: { tabId: tab.id, frameIds: [0] },
+        world: "MAIN",
+        func: (sel, uid) => {
+          const state = window.__PI_CHROME_STATE__;
+          let el = null;
+          if (uid && state && state.elements && state.elements[uid]) el = state.elements[uid];
+          else if (sel) el = document.querySelector(sel);
+          if (el && typeof el.focus === "function" && el === document.activeElement) {
+            try { el.blur(); el.focus({ preventScroll: true, focusVisible: false }); } catch {}
+          }
+        },
+        args: [params.selector ?? null, params.uid ?? null],
+      }, `reset focus style in tab ${tab.id}`).catch(() => undefined);
+    }
+    return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
+  } catch (error) {
+    if (params.domFallback === false) throw error;
+    return domClickFallback(tab.id, params, error);
   }
-  return { input: "chrome", x: point.x, y: point.y, tag: resolved.tag };
 }
 
 async function chromeInputHover(params) {
@@ -504,29 +617,74 @@ async function chromeInputType(params) {
   return { input: "chrome", length: text.length };
 }
 
+async function domFillFallback(tabId, params, cause) {
+  if (!(params.selector || params.uid)) throw cause;
+  const results = await executeScriptTimed({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: async (selector, uid, text, submit) => {
+      const state = window.__PI_CHROME_STATE__;
+      let el = uid && state && state.elements ? state.elements[uid] : null;
+      if (uid && (!el || !el.isConnected)) return { staleUid: true, reason: `snapshot uid ${uid} is stale; refresh chrome_snapshot`, url: location.href };
+      if (!el && selector) el = document.querySelector(selector);
+      if (!el) throw new Error(`DOM fallback target not found: ${uid || selector}`);
+      el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      if (typeof el.focus === "function") el.focus({ preventScroll: true });
+      const value = String(text ?? "");
+      if ("value" in el) {
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) setter.call(el, value);
+        else el.value = value;
+      } else if (el.isContentEditable) {
+        el.textContent = value;
+      } else {
+        throw new Error(`DOM fallback target is not fillable: <${el.tagName.toLowerCase()}>`);
+      }
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      if (submit) {
+        const form = el.closest("form");
+        if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
+        else document.querySelector("button,[type=submit]")?.click();
+      }
+      return { valueMatches: "value" in el ? el.value === value : el.textContent === value, tag: el.tagName, url: location.href };
+    },
+    args: [params.selector ?? null, params.uid ?? null, params.text ?? "", params.submit === true],
+  }, `DOM fill fallback in tab ${tabId}`);
+  const v = results?.[0]?.result;
+  if (v?.staleUid) throw new Error(v.reason || "snapshot uid is stale; refresh chrome_snapshot");
+  return { input: "dom-fallback", length: String(params.text || "").length, valueMatches: v?.valueMatches, reason: String(cause?.message || cause).slice(0, 500), tag: v?.tag };
+}
+
 async function chromeInputFill(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  await attachDebugger(tab.id);
-  if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
-  const resolved = await resolveTargetInTab(tab.id, params);
-  const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
-  await cdpMoveTo(tab.id, point.x, point.y);
-  // Triple-click selects all in input fields.
-  for (let i = 1; i <= 3; i++) {
-    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: i, pointerType: "mouse", force: 0.5 });
+  try {
+    await attachDebugger(tab.id);
+    if (!(params.selector || params.uid)) throw new Error("chrome.fill: selector or uid required");
+    const resolved = await resolveTargetInTab(tab.id, params);
+    const point = resolved.rect ? pickInsideRect(resolved.rect) : { x: resolved.x, y: resolved.y };
+    await cdpMoveTo(tab.id, point.x, point.y);
+    // Triple-click selects all in input fields.
+    for (let i = 1; i <= 3; i++) {
+      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: i, pointerType: "mouse", force: 0.5 });
+      await sleep(rng(20, 60));
+      await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
+      await sleep(rng(20, 60));
+    }
+    // Delete selection.
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
+    await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
     await sleep(rng(20, 60));
-    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: i, pointerType: "mouse" });
-    await sleep(rng(20, 60));
+    const text = String(params.text || "");
+    for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
+    if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
+    return { input: "chrome", length: text.length };
+  } catch (error) {
+    if (params.domFallback === false) throw error;
+    return domFillFallback(tab.id, params, error);
   }
-  // Delete selection.
-  await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-  await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 });
-  await sleep(rng(20, 60));
-  const text = String(params.text || "");
-  for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
-  if (params.submit) await chromeInputKey({ ...params, key: "Enter" });
-  return { input: "chrome", length: text.length };
 }
 
 async function chromeInputScroll(params) {
@@ -714,7 +872,12 @@ async function pollLoop() {
 
 async function handleCommand(command) {
   try {
-    const result = await dispatch(command.action, command.params ?? {});
+    const result = await withTimeout(
+      dispatch(command.action, command.params ?? {}),
+      COMMAND_TIMEOUT_MS,
+      command.action || "Chrome command",
+      () => detachAll(),
+    );
     await postResult({ id: command.id, ok: true, result });
   } catch (error) {
     await postResult({ id: command.id, ok: false, error: error?.message ?? String(error) });
@@ -936,7 +1099,7 @@ async function getTabByParams(params) {
   let tab;
   if (params.targetId !== undefined) {
     const id = Number(params.targetId);
-    tab = tabs.find((candidate) => candidate.id === id);
+    tab = await chrome.tabs.get(id).catch(() => null);
     if (!tab?.id) {
       // Chrome tab ids are not stable across reloads/navigations; a long session can hold a
       // stale id. Surface the current tabs so the caller can re-target instead of guessing.
@@ -960,8 +1123,9 @@ async function getTabByParams(params) {
     tab = active[0] || tabs.find((candidate) => candidate.active) || tabs[0];
   }
   if (!tab?.id) throw new Error("No matching Chrome tab found");
-  if ((tab.url || "").startsWith("chrome://") || (tab.url || "").startsWith("chrome-extension://")) {
-    throw new Error(`Chrome blocks extension automation on protected URL: ${tab.url}`);
+  const url = tab.url || "";
+  if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("devtools://")) {
+    throw new Error(`Chrome blocks extension automation on protected URL: tab=${tab.id} url=${url}`);
   }
   // Tabs Pi interacts with (page.* actions) join this session's group so the user can see exactly
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
@@ -1032,7 +1196,7 @@ async function executeInTab(params, func, args) {
   // Phase 2: run the action via chrome.scripting.executeScript. The `func:` form is
   // injected by Chrome itself (not `new Function`), so it is CSP-safe, and it lets Chrome
   // serialize the invocation args. The wrapper references window.__piAction defined above.
-  const results = await chrome.scripting.executeScript({
+  const results = await executeScriptTimed({
     target: { tabId: tab.id },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1043,7 +1207,7 @@ async function executeInTab(params, func, args) {
       }
     },
     args: [args || []],
-  });
+  }, `execute page action in tab ${tab.id}`);
   const first = results?.[0];
   if (first?.error) {
     const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
@@ -1139,12 +1303,12 @@ async function snapshotInTab(params) {
     params.query ?? null,
     params.maxTextChars ?? null,
   ];
-  await chrome.scripting.executeScript({
+  await executeScriptTimed({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
-  });
-  const results = await chrome.scripting.executeScript({
+  }, `inject snapshot script in tab ${tab.id}`);
+  const results = await executeScriptTimed({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1157,7 +1321,7 @@ async function snapshotInTab(params) {
       }
     },
     args: [args],
-  });
+  }, `run snapshot script in tab ${tab.id}`);
   const first = results?.[0];
   if (first?.error) {
     const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));
@@ -1175,12 +1339,12 @@ async function inspectInTab(params) {
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   const args = [params.uid ?? null, params.selector ?? null, params.scrollIntoView === true];
-  await chrome.scripting.executeScript({
+  await executeScriptTimed({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     files: ["snapshot_injected.js"],
-  });
-  const results = await chrome.scripting.executeScript({
+  }, `inject inspect script in tab ${tab.id}`);
+  const results = await executeScriptTimed({
     target: { tabId: tab.id, frameIds: [0] },
     world: "MAIN",
     func: async (invocationArgs) => {
@@ -1193,7 +1357,7 @@ async function inspectInTab(params) {
       }
     },
     args: [args],
-  });
+  }, `run inspect script in tab ${tab.id}`);
   const first = results?.[0];
   if (first?.error) {
     const message = typeof first.error === "string" ? first.error : (first.error.message || JSON.stringify(first.error));

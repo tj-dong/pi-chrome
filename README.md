@@ -15,34 +15,58 @@ You:    [keeps coding — agent never asked you to log in]
 
 ---
 
-## 60-second install
+## 60-second install instruction
+
+To install pi-chrome, run the following command:
 
 ```bash
 pi install npm:pi-chrome
 ```
 
-Then in Pi:
+
+Then in Pi, run the next command, which will:
+
+1. Reveal the bundled browser-extension folder in Finder, and copy the folder path to your clipboard.
+2. Pop open the chrome://extensions webpage in Chrome.
+
+In the Chrome Extensions page it opened, **YOU WILL NEED TO**:
+
+1. Turn on **developer mode** (top right).
+2. Click the **load unpacked** button (top left).
+3. Use **Cmd + Shift + G** (Mac) or **Ctrl + L** (Windows/Linux) to open the folder path field.
+4. **Cmd + V** (Mac) or **Ctrl + V** (Windows/Linux) to paste the copied path and press Enter.
+5. You're done with the chrome extensions page, and you can continue with the rest of the installation commands 
 
 ```text
 /chrome onboard
 ```
 
-On macOS this opens `chrome://extensions`, reveals the bundled `browser-extension/` folder in Finder, and copies its path to your clipboard. In Chrome: **Developer mode** → **Load unpacked** → paste the path. Done.
+Reload Pi so the newly installed package is actually loaded:
 
-Verify, then authorize current Pi session from the terminal:
+```text
+/reload
+```   
+                                                    
+
+Verify the chrome connection:
 
 ```text
 /chrome doctor
+```
+In the output, you just need to make sure the following line is present (It's okay if the other ones are still not checked):
+
+ ✓ Chrome is connected (companion extension v0.15.36, responded in 11ms). 
+
+Lastly, authorize the current session by running:
+```text
 /chrome authorize
 ```
 
-```text
-Performing Chrome bridge health check
-pi-chrome v<version>
-• Local bridge: mode=server, url=http://127.0.0.1:17318
-✓ Companion Chrome extension responding (ID: <chrome-extension-id>, ext v<version>)
-```
+Run the following once more, and you should see all the lines checked:
 
+```text
+/chrome doctor
+```
 ---
 
 ## Try this in 30 seconds after install
@@ -135,7 +159,7 @@ Agents can verify page state immediately instead of blindly retrying.
 
 ## What an agent gets
 
-**19 tools**, grouped by job. Every one runs against your already-open tabs.
+**21 tools**, grouped by job. Every one runs against your already-open tabs.
 
 | Category        | Tools                                                                                          |
 | --------------- | ---------------------------------------------------------------------------------------------- |
